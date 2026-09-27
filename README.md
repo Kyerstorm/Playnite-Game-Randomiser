@@ -18,6 +18,11 @@ the wheel makes a transparent, equal-probability decision.
 - A–Z, random or library ordering, plus a Shuffle button that never counts as a spin.
 - Works offline. There is no web dependency.
 
+## AI assistance disclosure
+
+This extension was built with AI assistance (Claude). All code has been reviewed, and the project's
+direction, design and features have been fully guided by me throughout.
+
 ## Install
 
 Double-click `dist/GameRandomiser_5a1e7c3d-9b2f-4e68-a0c4-7d3b91f2e865_1_0.pext`, or drag it onto
