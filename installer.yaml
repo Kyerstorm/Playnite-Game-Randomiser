@@ -1,0 +1,8 @@
+AddonId: "GameRandomiser_5a1e7c3d-9b2f-4e68-a0c4-7d3b91f2e865"
+Packages:
+  - Version: 1.0
+    RequiredApiVersion: 6.17.0
+    ReleaseDate: 2026-09-27
+    PackageUrl: https://github.com/Kyerstorm/Playnite-Game-Randomiser/releases/download/v1.0.0/GameRandomiser_5a1e7c3d-9b2f-4e68-a0c4-7d3b91f2e865_1_0.pext
+    Changelog:
+      - Initial release
