@@ -1,0 +1,58 @@
+<UserControl x:Class="GameRandomiser.UI.WheelCreationWindow"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- Hosted in a Playnite window, so Playnite's themed control styles apply automatically. -->
+    <DockPanel Margin="20,16,20,16">
+        <DockPanel DockPanel.Dock="Bottom" Margin="0,16,0,0" LastChildFill="False">
+            <TextBlock x:Name="CountText" DockPanel.Dock="Left" VerticalAlignment="Center" FontWeight="Bold" FontSize="15" />
+            <Button DockPanel.Dock="Right" Content="Cancel" IsCancel="True" Margin="8,0,0,0" MinWidth="90" Padding="12,6" Click="Cancel_Click" />
+            <Button x:Name="CreateButton" DockPanel.Dock="Right" Content="Create wheel" IsDefault="True" MinWidth="130" Padding="12,6" Click="Create_Click" />
+        </DockPanel>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel>
+                <TextBlock Text="Name" FontWeight="SemiBold" Margin="0,0,0,4" />
+                <TextBox x:Name="NameBox" TextChanged="NameBox_TextChanged" AutomationProperties.Name="Wheel name" />
+
+                <TextBlock Text="Icon" FontWeight="SemiBold" Margin="0,14,0,4" />
+                <WrapPanel x:Name="IconPanel" />
+
+                <TextBlock Text="Population" FontWeight="SemiBold" Margin="0,16,0,6" />
+                <RadioButton x:Name="EmptyRadio" GroupName="Population" Content="Empty wheel" Margin="0,2" Checked="Population_Changed" />
+                <RadioButton x:Name="ManualRadio" GroupName="Population" Content="Manually selected games" Margin="0,2" Checked="Population_Changed" />
+                <StackPanel x:Name="ManualPanel" Orientation="Horizontal" Margin="26,6,0,6">
+                    <Button Content="Choose games…" Padding="12,5" Click="ChooseGames_Click" />
+                    <TextBlock x:Name="ManualCountText" VerticalAlignment="Center" Margin="12,0,0,0" Opacity="0.8" />
+                </StackPanel>
+                <RadioButton x:Name="AutoRadio" GroupName="Population" Content="Automatically populated from your library" Margin="0,2" Checked="Population_Changed" />
+                <StackPanel x:Name="AutoPanel" Margin="26,6,0,6">
+                    <TextBlock Text="Populate from" Margin="0,0,0,4" />
+                    <ComboBox x:Name="RuleCombo" DisplayMemberPath="DisplayName" SelectionChanged="Criteria_Changed" AutomationProperties.Name="Populate from" />
+                    <TextBlock x:Name="RuleHelp" TextWrapping="Wrap" Opacity="0.75" Margin="0,6,0,0" />
+
+                    <StackPanel x:Name="LookupPanel" Margin="0,10,0,0">
+                        <TextBlock x:Name="LookupLabel" Text="Criteria" Margin="0,0,0,4" />
+                        <TextBox x:Name="LookupSearch" TextChanged="LookupSearch_TextChanged" AutomationProperties.Name="Search criteria" />
+                        <ListBox x:Name="LookupList" Height="190" Margin="0,6,0,0" VirtualizingPanel.IsVirtualizing="True">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <CheckBox Content="{Binding Name}" IsChecked="{Binding IsChecked, Mode=TwoWay}" Checked="Lookup_Changed" Unchecked="Lookup_Changed" />
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                        <TextBlock Text="Games matching any ticked item are included." Opacity="0.7" FontSize="12" Margin="0,4,0,0" />
+                    </StackPanel>
+
+                    <StackPanel x:Name="AmountPanel" Orientation="Horizontal" Margin="0,10,0,0">
+                        <TextBox x:Name="AmountBox" Width="90" TextChanged="Criteria_Changed" AutomationProperties.Name="Amount" />
+                        <TextBlock x:Name="AmountUnit" VerticalAlignment="Center" Margin="8,0,0,0" />
+                    </StackPanel>
+                </StackPanel>
+
+                <TextBlock Text="Arrange games" FontWeight="SemiBold" Margin="0,16,0,4" />
+                <ComboBox x:Name="SortCombo" DisplayMemberPath="Label" AutomationProperties.Name="Arrange games" />
+                <TextBlock Text="Arrangement never changes the odds: every game on the wheel is equally likely to win." TextWrapping="Wrap" Opacity="0.7" FontSize="12" Margin="0,4,0,0" />
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+</UserControl>

@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The Playnite extension: lifecycle, Playnite integration and the WPF user interface. -->
+  <PropertyGroup>
+    <TargetFramework>net462</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>GameRandomiser</AssemblyName>
+    <RootNamespace>GameRandomiser</RootNamespace>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <NoWarn>$(NoWarn);NU1903</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <!-- Both are provided by Playnite at runtime; compile only. -->
+    <PackageReference Include="PlayniteSDK" Version="6.17.0" ExcludeAssets="runtime" />
+    <PackageReference Include="Newtonsoft.Json" Version="10.0.3" ExcludeAssets="runtime" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\GameRandomiser.Core\GameRandomiser.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="extension.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="icon.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="GameRandomiser.VisualHarness" />
+  </ItemGroup>
+</Project>
