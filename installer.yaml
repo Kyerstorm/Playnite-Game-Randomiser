@@ -6,3 +6,13 @@ Packages:
     PackageUrl: https://github.com/Kyerstorm/Playnite-Game-Randomiser/releases/download/v1.0.0/GameRandomiser_5a1e7c3d-9b2f-4e68-a0c4-7d3b91f2e865_1_0.pext
     Changelog:
       - Initial release
+  - Version: 1.1
+    RequiredApiVersion: 6.17.0
+    ReleaseDate: 2026-10-04
+    PackageUrl: https://github.com/Kyerstorm/Playnite-Game-Randomiser/releases/download/v1.1.0/GameRandomiser_5a1e7c3d-9b2f-4e68-a0c4-7d3b91f2e865_1_1.pext
+    Changelog:
+      - "Dynamic wheels: wheels created from criteria can keep themselves in sync with your library (strict, or with pinned games)"
+      - "Reroll protection: skip recent winners, limit rerolls, optional cooldown (off by default)"
+      - "Safer saving: unchanged data is not rewritten, unreadable files are backed up, failed saves are reported and retried"
+      - Clearer error messages and refresh status for wheels
+      - Existing wheels, history and settings are kept and behave as before until you opt in
