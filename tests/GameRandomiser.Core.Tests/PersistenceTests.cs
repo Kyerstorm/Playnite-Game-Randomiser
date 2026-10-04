@@ -72,7 +72,7 @@ namespace GameRandomiser.Core.Tests
                 var path = dir.File("data.json");
                 var store = Build.FileStore(path);
                 store.Save(new RandomiserData());
-                store.Save(new RandomiserData());
+                store.Save(new RandomiserData { Wheels = { new RandomiserWheel { Name = "Second save" } } });
 
                 Assert.True(File.Exists(path));
                 Assert.True(File.Exists(path + ".bak"));

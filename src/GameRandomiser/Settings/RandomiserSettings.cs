@@ -13,7 +13,7 @@ namespace GameRandomiser.Settings
     /// </summary>
     public class RandomiserSettings
     {
-        public const int CurrentVersion = 1;
+        public const int CurrentVersion = 2;
 
         public int SettingsVersion { get; set; } = CurrentVersion;
 
@@ -60,10 +60,14 @@ namespace GameRandomiser.Settings
 
         public bool ShowConfetti { get; set; } = true;
 
+        // Reroll protection (off by default; state is kept per wheel in data.json)
+        public RerollProtectionOptions Reroll { get; set; } = new RerollProtectionOptions();
+
         public RandomiserSettings Clone()
         {
             var clone = (RandomiserSettings)MemberwiseClone();
             clone.SegmentColours = new List<string>(SegmentColours ?? new List<string>());
+            clone.Reroll = (Reroll ?? new RerollProtectionOptions()).Clone();
             return clone;
         }
 
@@ -96,6 +100,7 @@ namespace GameRandomiser.Settings
             SpinIntensity = Enum.IsDefined(typeof(SpinIntensity), SpinIntensity) ? SpinIntensity : SpinIntensity.Normal;
             WinnerPresentation = Enum.IsDefined(typeof(WinnerPresentation), WinnerPresentation) ? WinnerPresentation : WinnerPresentation.Card;
             WinnerBehaviour = Enum.IsDefined(typeof(WinnerBehaviour), WinnerBehaviour) ? WinnerBehaviour : WinnerBehaviour.AskMe;
+            Reroll = (Reroll ?? new RerollProtectionOptions()).Sanitize();
             SettingsVersion = CurrentVersion;
             return this;
         }

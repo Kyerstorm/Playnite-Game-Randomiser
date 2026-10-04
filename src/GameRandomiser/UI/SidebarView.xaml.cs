@@ -271,5 +271,15 @@ namespace GameRandomiser.UI
         private void Install_Click(object sender, RoutedEventArgs e) => Guard(viewModel.InstallWinner);
 
         private void Details_Click(object sender, RoutedEventArgs e) => Guard(viewModel.ViewWinnerDetails);
+
+        private void AcceptPick_Click(object sender, RoutedEventArgs e) => Guard(viewModel.AcceptPick);
+
+        private void ResetProtection_Click(object sender, RoutedEventArgs e) => Guard(viewModel.ResetProtection);
+
+        private void PinSelected_Click(object sender, RoutedEventArgs e) => Guard(viewModel.PinCheckedGames);
+
+        private void UnpinSelected_Click(object sender, RoutedEventArgs e) => Guard(viewModel.UnpinCheckedGames);
+
+        private void RestoreRemoved_Click(object sender, RoutedEventArgs e) => Guard(viewModel.RestoreRemovedGames);
     }
 }

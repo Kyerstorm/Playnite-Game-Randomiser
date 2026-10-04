@@ -1,9 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using GameRandomiser.Core.Abstractions;
+using GameRandomiser.Core.Diagnostics;
 using GameRandomiser.Core.Models;
+using GameRandomiser.Core.Population;
 using GameRandomiser.Core.Services;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace GameRandomiser.Core.Tests
 {
@@ -344,6 +349,572 @@ namespace GameRandomiser.Core.Tests
                 Assert.Single(history);
                 Assert.Equal(hades.Id, history[0].GameId);
             }
+        }
+    }
+
+    /// <summary>Dynamic membership: the reconciliation rules and the refresh coordinator.</summary>
+    public class DynamicWheelTests
+    {
+        private readonly ITestOutputHelper output;
+        private readonly FakeCatalog catalog = new FakeCatalog();
+        private readonly InMemoryStore store = new InMemoryStore();
+        private readonly ManualScheduler scheduler = new ManualScheduler();
+        private readonly RecordingReporter errors = new RecordingReporter();
+        private readonly FixedClock clock = new FixedClock();
+        private readonly List<WheelRefreshResult> results = new List<WheelRefreshResult>();
+        private readonly Guid rpg = Guid.NewGuid();
+        private readonly WheelService wheels;
+        private readonly PopulationEngine engine;
+        private readonly RefreshCoordinator coordinator;
+        private readonly GameInfo alpha, bravo, charlie, hidden;
+
+        public DynamicWheelTests(ITestOutputHelper output)
+        {
+            this.output = output;
+            alpha = catalog.Add("Alpha", g => { g.IsInstalled = true; g.GenreIds = new[] { rpg }; });
+            bravo = catalog.Add("Bravo", g => g.IsInstalled = true);
+            charlie = catalog.Add("Charlie");
+            hidden = catalog.Add("Hidden", g => { g.IsInstalled = true; g.IsHidden = true; });
+            wheels = Build.Service(catalog, store, clock: clock);
+            engine = new PopulationEngine(catalog, clock: clock);
+            coordinator = NewCoordinator(catalog, scheduler);
+        }
+
+        private RefreshCoordinator NewCoordinator(IGameCatalog source, ManualScheduler with)
+        {
+            var created = new RefreshCoordinator(wheels, engine, source, with, new SeededRandomSource(7), errors);
+            created.Completed += (s, e) => results.AddRange(e.Results);
+            return created;
+        }
+
+        private RandomiserWheel Create(string name, PopulationSpec spec, MembershipPolicy policy, SortMode sort = SortMode.Alphabetical) =>
+            wheels.CreateWheel(name, engine.Evaluate(spec).Select(g => g.Id), sort, spec, policy: policy);
+
+        private RandomiserWheel Installed(MembershipPolicy policy, string name = "Installed") =>
+            Create(name, new PopulationSpec { Source = PopulationSource.Installed }, policy);
+
+        private void LibraryChanged(LibraryFields fields)
+        {
+            coordinator.InvalidateLibrary(fields);
+            scheduler.FireDebounce();
+        }
+
+        private IReadOnlyList<Guid> Ids(RandomiserWheel wheel) => wheels.GetWheel(wheel.Id).GameIds;
+
+        // ---- Policies ----
+
+        [Fact]
+        public void NewDynamicWheel_ContainsOnlyVisibleMatchingGames()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+
+            Assert.True(wheel.IsDynamic);
+            Assert.Equal(new[] { alpha.Id, bravo.Id }, Ids(wheel));
+            Assert.DoesNotContain(hidden.Id, Ids(wheel));
+            Assert.Equal(RefreshStatus.Refreshed, wheels.GetRefreshInfo(wheel.Id).Status);
+        }
+
+        [Fact]
+        public void Strict_AddsNewMatches_AndRemovesGamesThatStopMatching()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            charlie.IsInstalled = true;
+            alpha.IsInstalled = false;
+
+            LibraryChanged(LibraryFields.Installed);
+
+            Assert.Equal(new[] { bravo.Id, charlie.Id }, Ids(wheel));
+            var result = Assert.Single(results);
+            Assert.Equal(RefreshResultKind.Updated, result.Kind);
+            Assert.Equal(1, result.Added);
+            Assert.Equal(1, result.Removed);
+        }
+
+        [Fact]
+        public void UninstalledGame_StaysOnASnapshot_ButLeavesAStrictInstalledWheel()
+        {
+            var snapshot = Installed(MembershipPolicy.ManualSnapshot, "Snapshot");
+            var strict = Installed(MembershipPolicy.StrictCriteria, "Strict");
+            alpha.IsInstalled = false;
+
+            LibraryChanged(LibraryFields.Installed);
+
+            Assert.Contains(alpha.Id, Ids(snapshot));
+            Assert.DoesNotContain(alpha.Id, Ids(strict));
+        }
+
+        [Fact]
+        public void Pinned_GameStaysWhenItStopsMatching()
+        {
+            var wheel = Installed(MembershipPolicy.CriteriaPlusPinned);
+            Assert.Equal(1, wheels.PinGames(wheel.Id, new[] { alpha.Id }));
+            alpha.IsInstalled = false;
+            bravo.IsInstalled = false;
+
+            LibraryChanged(LibraryFields.Installed);
+
+            Assert.Equal(new[] { alpha.Id }, Ids(wheel));
+        }
+
+        [Fact]
+        public void Pinned_HiddenGameIsNeverEligible_AndDeletedGameIsForgotten()
+        {
+            var wheel = Installed(MembershipPolicy.CriteriaPlusPinned);
+            wheels.PinGames(wheel.Id, new[] { alpha.Id });
+
+            alpha.IsHidden = true;
+            wheels.RemoveGamesFromAllWheels(new[] { alpha.Id });
+            LibraryChanged(LibraryFields.Hidden);
+            Assert.DoesNotContain(alpha.Id, Ids(wheel));
+            Assert.True(wheels.IsPinned(wheel.Id, alpha.Id));
+
+            alpha.IsHidden = false;
+            LibraryChanged(LibraryFields.Hidden);
+            Assert.Contains(alpha.Id, Ids(wheel));
+
+            catalog.Remove(alpha.Id);
+            wheels.ForgetGames(new[] { alpha.Id });
+            LibraryChanged(LibraryFields.Collection);
+            Assert.DoesNotContain(alpha.Id, Ids(wheel));
+            Assert.False(wheels.IsPinned(wheel.Id, alpha.Id));
+        }
+
+        [Fact]
+        public void ManualSnapshot_IsNeverChangedAutomatically()
+        {
+            var wheel = Installed(MembershipPolicy.ManualSnapshot);
+            var saves = store.SaveCount;
+            charlie.IsInstalled = true;
+            alpha.IsInstalled = false;
+
+            coordinator.InvalidateLibrary(LibraryFields.All);
+            coordinator.InvalidateAll(RefreshReason.Startup);
+            coordinator.InvalidateWheel(wheel.Id, RefreshReason.LibraryChanged);
+            scheduler.FireDebounce();
+
+            Assert.Equal(new[] { alpha.Id, bravo.Id }, Ids(wheel));
+            Assert.Equal(0, coordinator.BatchesStarted);
+            Assert.Equal(saves, store.SaveCount);
+            Assert.Equal(RefreshStatus.NotApplicable, wheels.GetRefreshInfo(wheel.Id).Status);
+        }
+
+        [Fact]
+        public void ManualSnapshot_ExplicitRefresh_AddsMatches_ButNeverRemoves()
+        {
+            var wheel = Installed(MembershipPolicy.ManualSnapshot);
+            charlie.IsInstalled = true;
+            alpha.IsInstalled = false;
+
+            coordinator.InvalidateWheel(wheel.Id, RefreshReason.Manual);
+
+            Assert.Equal(new[] { alpha.Id, bravo.Id, charlie.Id }, Ids(wheel));
+            Assert.Equal(RefreshReason.Manual, Assert.Single(results).Reason);
+        }
+
+        [Fact]
+        public void DynamicPolicy_RequiresCriteria_AndPinningRequiresThePinnedPolicy()
+        {
+            var plain = wheels.CreateWheel("Plain", new[] { alpha.Id });
+            var strict = Installed(MembershipPolicy.StrictCriteria);
+
+            var noCriteria = Assert.Throws<ArgumentException>(() => wheels.SetMembershipPolicy(plain.Id, MembershipPolicy.StrictCriteria));
+            Assert.Equal(UserMessages.NoCriteria, noCriteria.Message);
+            var noPins = Assert.Throws<ArgumentException>(() => wheels.PinGames(strict.Id, new[] { alpha.Id }));
+            Assert.Equal(UserMessages.PinRequiresPolicy, noPins.Message);
+        }
+
+        // ---- Manual edits on dynamic wheels ----
+
+        [Fact]
+        public void RemovingAGame_FromADynamicWheel_Sticks_UntilItIsAddedBack()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+
+            wheels.RemoveGames(wheel.Id, new[] { bravo.Id });
+            LibraryChanged(LibraryFields.Collection);
+            Assert.Equal(new[] { alpha.Id }, Ids(wheel));
+
+            var added = wheels.AddGames(wheel.Id, new[] { bravo.Id });
+            scheduler.FireDebounce();
+            Assert.Equal(1, added.Added);
+            Assert.Equal(new[] { alpha.Id, bravo.Id }, Ids(wheel));
+            Assert.Empty(wheels.GetWheel(wheel.Id).ExcludedGameIds);
+        }
+
+        [Fact]
+        public void StrictWheel_RejectsGamesThatDoNotMatch()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+
+            var result = wheels.AddGames(wheel.Id, new[] { charlie.Id, alpha.Id, hidden.Id });
+
+            Assert.Equal(0, result.Added);
+            Assert.Equal(1, result.NotMatching);
+            Assert.Equal(1, result.AlreadyPresent);
+            Assert.Equal(1, result.Ineligible);
+            Assert.Equal(new[] { alpha.Id, bravo.Id }, Ids(wheel));
+        }
+
+        [Fact]
+        public void PinnedWheel_AddingAGame_PinsIt()
+        {
+            var wheel = Installed(MembershipPolicy.CriteriaPlusPinned);
+
+            Assert.Equal(1, wheels.AddGames(wheel.Id, new[] { charlie.Id }).Added);
+            scheduler.FireDebounce();
+
+            Assert.True(wheels.IsPinned(wheel.Id, charlie.Id));
+            Assert.Equal(new[] { alpha.Id, bravo.Id, charlie.Id }, Ids(wheel));
+        }
+
+        [Fact]
+        public void SwitchingASnapshotToPinned_KeepsHandPickedGames()
+        {
+            var wheel = Installed(MembershipPolicy.ManualSnapshot);
+            wheels.AddGames(wheel.Id, new[] { charlie.Id });
+
+            wheels.SetMembershipPolicy(wheel.Id, MembershipPolicy.CriteriaPlusPinned);
+            coordinator.InvalidateWheel(wheel.Id, RefreshReason.RulesChanged, pinUnmatched: true);
+            scheduler.FireDebounce();
+
+            Assert.Equal(new[] { alpha.Id, bravo.Id, charlie.Id }, Ids(wheel));
+            Assert.True(wheels.IsPinned(wheel.Id, charlie.Id));
+            Assert.False(wheels.IsPinned(wheel.Id, alpha.Id));
+        }
+
+        [Fact]
+        public void SwitchingASnapshotToStrict_RemovesGamesThatDoNotMatch()
+        {
+            var wheel = Installed(MembershipPolicy.ManualSnapshot);
+            wheels.AddGames(wheel.Id, new[] { charlie.Id });
+
+            wheels.SetMembershipPolicy(wheel.Id, MembershipPolicy.StrictCriteria);
+            scheduler.FireDebounce();
+
+            Assert.Equal(new[] { alpha.Id, bravo.Id }, Ids(wheel));
+        }
+
+        [Fact]
+        public void ChangingCriteria_RefreshesTheWheel()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+
+            wheels.SetPopulation(wheel.Id, new PopulationSpec { Source = PopulationSource.NotInstalled });
+            scheduler.FireDebounce();
+
+            Assert.Equal(new[] { charlie.Id }, Ids(wheel));
+        }
+
+        // ---- Determinism ----
+
+        [Fact]
+        public void Refresh_IsIdempotent_AndWritesNothingWhenNothingChanged()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            charlie.IsInstalled = true;
+            LibraryChanged(LibraryFields.Installed);
+            var after = Ids(wheel).ToList();
+            var saves = store.SaveCount;
+
+            LibraryChanged(LibraryFields.Installed);
+            LibraryChanged(LibraryFields.All);
+
+            Assert.Equal(after, Ids(wheel));
+            Assert.Equal(saves, store.SaveCount);
+            Assert.Equal(RefreshResultKind.Unchanged, results.Last().Kind);
+        }
+
+        [Fact]
+        public void RefreshedList_NeverContainsDuplicates()
+        {
+            var wheel = Installed(MembershipPolicy.CriteriaPlusPinned);
+            wheels.PinGames(wheel.Id, new[] { alpha.Id, alpha.Id, bravo.Id });
+            charlie.IsInstalled = true;
+
+            LibraryChanged(LibraryFields.All);
+
+            var ids = Ids(wheel);
+            Assert.Equal(ids.Distinct().Count(), ids.Count);
+            Assert.Equal(3, ids.Count);
+        }
+
+        [Fact]
+        public void RandomlyArrangedWheel_KeepsExistingPositions_WhenAGameIsAdded()
+        {
+            var spec = new PopulationSpec { Source = PopulationSource.Installed };
+            var wheel = Create("Shuffled", spec, MembershipPolicy.StrictCriteria, SortMode.Random);
+            var before = Ids(wheel).ToList();
+            charlie.IsInstalled = true;
+
+            LibraryChanged(LibraryFields.Installed);
+
+            Assert.Contains(charlie.Id, Ids(wheel));
+            Assert.Equal(before, Ids(wheel).Where(id => id != charlie.Id));
+        }
+
+        // ---- Failures ----
+
+        [Fact]
+        public void FailedRefresh_KeepsTheLastKnownGoodList_AndSaysSo()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            var before = Ids(wheel).ToList();
+            catalog.FailReads = true;
+
+            LibraryChanged(LibraryFields.Installed);
+
+            var info = wheels.GetRefreshInfo(wheel.Id);
+            Assert.Equal(before, Ids(wheel));
+            Assert.Equal(RefreshStatus.FailedUsingLastKnownGood, info.Status);
+            Assert.True(info.IsStale);
+            Assert.Equal(UserMessages.LibraryUnavailable, info.Error);
+            var error = Assert.Single(errors.Errors);
+            Assert.Equal(ErrorCategory.GameResolution, error.Category);
+            Assert.Equal(wheel.Id, error.WheelId);
+
+            // Failing again changes nothing worth writing.
+            var saves = store.SaveCount;
+            LibraryChanged(LibraryFields.Installed);
+            Assert.Equal(saves, store.SaveCount);
+
+            catalog.FailReads = false;
+            charlie.IsInstalled = true;
+            LibraryChanged(LibraryFields.Installed);
+            Assert.Equal(RefreshStatus.Refreshed, wheels.GetRefreshInfo(wheel.Id).Status);
+            Assert.Null(wheels.GetRefreshInfo(wheel.Id).Error);
+            Assert.Contains(charlie.Id, Ids(wheel));
+        }
+
+        [Fact]
+        public void BackgroundFailure_IsObserved_AndKeepsTheList()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            var before = Ids(wheel).ToList();
+            var source = new SnapshotCatalog(catalog) { Snapshot = () => throw new InvalidOperationException("worker died") };
+            var other = new ManualScheduler();
+            var failing = NewCoordinator(source, other);
+
+            failing.InvalidateLibrary(LibraryFields.Installed);
+            other.FireDebounce();
+
+            Assert.Equal(before, Ids(wheel));
+            Assert.Equal(RefreshResultKind.Failed, results.Single().Kind);
+            Assert.Equal(UserMessages.RefreshFailed, wheels.GetRefreshInfo(wheel.Id).Error);
+            Assert.False(failing.IsRunning);
+        }
+
+        [Fact]
+        public void EmptyLibraryRead_NeverEmptiesAWheel()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            var source = new SnapshotCatalog(catalog) { Snapshot = () => new LibrarySnapshot(new GameInfo[0]) };
+            var other = new ManualScheduler();
+            var empty = NewCoordinator(source, other);
+
+            empty.InvalidateLibrary(LibraryFields.Collection);
+            other.FireDebounce();
+
+            Assert.Equal(new[] { alpha.Id, bravo.Id }, Ids(wheel));
+            Assert.Equal(UserMessages.LibraryUnavailable, wheels.GetRefreshInfo(wheel.Id).Error);
+        }
+
+        [Fact]
+        public void InvalidRule_FailsWithAnActionableMessage()
+        {
+            var wheel = wheels.CreateWheel("Broken", new[] { alpha.Id },
+                population: new PopulationSpec { Source = (PopulationSource)999 }, policy: MembershipPolicy.StrictCriteria);
+
+            coordinator.InvalidateWheel(wheel.Id, RefreshReason.Manual);
+
+            var result = Assert.Single(results);
+            Assert.Equal(RefreshResultKind.Failed, result.Kind);
+            Assert.Equal(UserMessages.InvalidPopulationRule, result.ErrorMessage);
+            Assert.Equal(ErrorCategory.PopulationRule, result.Category);
+            Assert.Equal(new[] { alpha.Id }, Ids(wheel));
+        }
+
+        // ---- Coordination ----
+
+        [Fact]
+        public void BurstOfLibraryEvents_IsCoalescedIntoOneRefresh()
+        {
+            Installed(MembershipPolicy.StrictCriteria);
+
+            for (var i = 0; i < 50; i++)
+            {
+                coordinator.InvalidateLibrary(LibraryFields.Installed);
+            }
+
+            Assert.Equal(50, scheduler.DebounceCalls);
+            Assert.Equal(0, coordinator.BatchesStarted);
+
+            Assert.True(scheduler.FireDebounce());
+            Assert.Equal(1, coordinator.BatchesStarted);
+            Assert.Single(results);
+            Assert.False(scheduler.FireDebounce());
+        }
+
+        [Fact]
+        public void OnlyWheelsThatDependOnTheChange_AreRefreshed()
+        {
+            var installed = Installed(MembershipPolicy.StrictCriteria);
+            var genre = Create("RPGs", new PopulationSpec { Source = PopulationSource.Genre, ItemIds = { rpg } }, MembershipPolicy.StrictCriteria);
+
+            LibraryChanged(LibraryFields.Genres);
+            Assert.Equal(new[] { genre.Id }, results.Select(r => r.WheelId));
+
+            results.Clear();
+            LibraryChanged(LibraryFields.Playtime);
+            Assert.Empty(results);
+
+            // A game joining or leaving the library can affect any wheel.
+            LibraryChanged(LibraryFields.Collection);
+            Assert.Equal(new[] { installed.Id, genre.Id }.OrderBy(id => id), results.Select(r => r.WheelId).OrderBy(id => id));
+        }
+
+        [Fact]
+        public void RefreshRequestedDuringASpin_WaitsForTheSpinToEnd()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            var spin = coordinator.Suspend();
+            charlie.IsInstalled = true;
+
+            LibraryChanged(LibraryFields.Installed);
+
+            Assert.Equal(0, coordinator.BatchesStarted);
+            Assert.True(coordinator.HasPending);
+            Assert.Equal(new[] { alpha.Id, bravo.Id }, Ids(wheel));
+
+            spin.Dispose();
+            Assert.Equal(new[] { alpha.Id, bravo.Id, charlie.Id }, Ids(wheel));
+        }
+
+        [Fact]
+        public void ResultArrivingDuringASpin_IsAppliedWhenTheSpinEnds()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            scheduler.HoldWork = true;
+            charlie.IsInstalled = true;
+            LibraryChanged(LibraryFields.Installed);
+            Assert.True(coordinator.IsRunning);
+            Assert.Equal(RefreshStatus.Refreshing, wheels.GetRefreshInfo(wheel.Id).Status);
+
+            var spin = coordinator.Suspend();
+            scheduler.CompleteNext();
+            Assert.DoesNotContain(charlie.Id, Ids(wheel));
+
+            spin.Dispose();
+            Assert.Contains(charlie.Id, Ids(wheel));
+            Assert.Equal(RefreshStatus.Refreshed, wheels.GetRefreshInfo(wheel.Id).Status);
+        }
+
+        [Fact]
+        public void EditDuringARefresh_DiscardsTheStaleResult_AndRefreshesAgain()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            scheduler.HoldWork = true;
+            charlie.IsInstalled = true;
+            LibraryChanged(LibraryFields.Installed);
+
+            wheels.RemoveGames(wheel.Id, new[] { bravo.Id });
+            scheduler.CompleteNext();
+
+            Assert.Equal(RefreshResultKind.Superseded, results.Last().Kind);
+            Assert.Equal(new[] { alpha.Id }, Ids(wheel));
+
+            Assert.True(scheduler.FireDebounce());
+            scheduler.CompleteNext();
+            Assert.Equal(new[] { alpha.Id, charlie.Id }, Ids(wheel));
+        }
+
+        [Fact]
+        public void RequestsMadeWhileARefreshIsRunning_AreNotLost_AndNeverOverlap()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            scheduler.HoldWork = true;
+            charlie.IsInstalled = true;
+            LibraryChanged(LibraryFields.Installed);
+
+            alpha.IsInstalled = false;
+            LibraryChanged(LibraryFields.Installed);
+            Assert.Equal(1, coordinator.BatchesStarted);
+            Assert.Equal(1, scheduler.PendingWork);
+
+            scheduler.CompleteNext();
+            Assert.Equal(2, coordinator.BatchesStarted);
+            scheduler.CompleteNext();
+
+            Assert.Equal(0, scheduler.PendingWork);
+            Assert.False(coordinator.IsRunning);
+            Assert.Equal(new[] { bravo.Id, charlie.Id }, Ids(wheel));
+        }
+
+        [Fact]
+        public void Dispose_StopsEverything_AndIgnoresLateResults()
+        {
+            var wheel = Installed(MembershipPolicy.StrictCriteria);
+            scheduler.HoldWork = true;
+            charlie.IsInstalled = true;
+            LibraryChanged(LibraryFields.Installed);
+
+            coordinator.Dispose();
+            scheduler.CompleteNext();
+            var calls = scheduler.DebounceCalls;
+            coordinator.InvalidateLibrary(LibraryFields.All);
+
+            Assert.True(scheduler.Disposed);
+            Assert.DoesNotContain(charlie.Id, Ids(wheel));
+            Assert.Equal(calls, scheduler.DebounceCalls);
+        }
+
+        // ---- Scale ----
+
+        [Theory]
+        [InlineData(500)]
+        [InlineData(2000)]
+        [InlineData(5000)]
+        [InlineData(10000)]
+        public void LargeLibrary_RefreshesWithinBudget(int size)
+        {
+            var library = new FakeCatalog();
+            var genre = Guid.NewGuid();
+            for (var i = 0; i < size; i++)
+            {
+                var index = i;
+                library.Add("Game " + index.ToString("00000"), g =>
+                {
+                    g.IsInstalled = index % 2 == 0;
+                    g.PlaytimeSeconds = index % 3 == 0 ? 0UL : 3600UL;
+                    g.GenreIds = index % 5 == 0 ? new[] { genre } : new Guid[0];
+                });
+            }
+
+            var bigStore = new InMemoryStore();
+            var service = Build.Service(library, bigStore, clock: clock);
+            var with = new ManualScheduler();
+            var refresh = new RefreshCoordinator(service, new PopulationEngine(library, clock: clock), library, with, new SeededRandomSource(3));
+            var installed = service.CreateWheel("Installed", population: new PopulationSpec { Source = PopulationSource.Installed }, policy: MembershipPolicy.StrictCriteria);
+            service.CreateWheel("Never played", population: new PopulationSpec { Source = PopulationSource.NeverPlayed }, policy: MembershipPolicy.StrictCriteria);
+            service.CreateWheel("Genre", population: new PopulationSpec { Source = PopulationSource.Genre, ItemIds = { genre } }, policy: MembershipPolicy.CriteriaPlusPinned);
+            service.CreateWheel("Everything", sortMode: SortMode.Library, population: new PopulationSpec { Source = PopulationSource.AllGames }, policy: MembershipPolicy.StrictCriteria);
+
+            var populate = Stopwatch.StartNew();
+            refresh.InvalidateAll(RefreshReason.Startup);
+            with.FireDebounce();
+            populate.Stop();
+
+            var saves = bigStore.SaveCount;
+            var unchanged = Stopwatch.StartNew();
+            refresh.InvalidateLibrary(LibraryFields.All);
+            with.FireDebounce();
+            unchanged.Stop();
+
+            output.WriteLine($"{size} games, 4 dynamic wheels: populate {populate.ElapsedMilliseconds} ms, no-change refresh {unchanged.ElapsedMilliseconds} ms");
+            Assert.Equal(size / 2, service.GetWheel(installed.Id).GameIds.Count);
+            Assert.Equal(1, saves - 4);
+            Assert.Equal(saves, bigStore.SaveCount);
+            Assert.True(populate.ElapsedMilliseconds < 5000, $"populate took {populate.ElapsedMilliseconds} ms");
+            Assert.True(unchanged.ElapsedMilliseconds < 5000, $"refresh took {unchanged.ElapsedMilliseconds} ms");
         }
     }
 }

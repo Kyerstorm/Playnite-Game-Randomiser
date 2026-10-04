@@ -47,6 +47,10 @@
                         <TextBox x:Name="AmountBox" Width="90" TextChanged="Criteria_Changed" AutomationProperties.Name="Amount" />
                         <TextBlock x:Name="AmountUnit" VerticalAlignment="Center" Margin="8,0,0,0" />
                     </StackPanel>
+
+                    <TextBlock Text="Keep the wheel up to date" Margin="0,14,0,4" />
+                    <ComboBox x:Name="PolicyCombo" DisplayMemberPath="Label" SelectionChanged="Policy_Changed" AutomationProperties.Name="Membership policy" />
+                    <TextBlock x:Name="PolicyHelp" TextWrapping="Wrap" Opacity="0.75" Margin="0,6,0,0" />
                 </StackPanel>
 
                 <TextBlock Text="Arrange games" FontWeight="SemiBold" Margin="0,16,0,4" />

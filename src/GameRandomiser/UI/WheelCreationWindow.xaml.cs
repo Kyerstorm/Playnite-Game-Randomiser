@@ -68,6 +68,10 @@ namespace GameRandomiser.UI
             SortCombo.ItemsSource = sortOptions;
             SortCombo.SelectedItem = sortOptions.First(o => o.Value == context.Settings.DefaultSortMode);
 
+            // Snapshot stays the default: a wheel only updates itself when the user asks for that.
+            PolicyCombo.ItemsSource = MembershipPolicyOptions.All;
+            PolicyCombo.SelectedItem = MembershipPolicyOptions.All[0];
+
             SetName(context.Wheels.MakeUniqueName(preselected != null && preselected.Count > 0 ? "My picks" : "New wheel"));
             if (manualGames.Count > 0)
             {
@@ -258,6 +262,9 @@ namespace GameRandomiser.UI
 
         private void Lookup_Changed(object sender, RoutedEventArgs e) => SchedulePreview();
 
+        private void Policy_Changed(object sender, SelectionChangedEventArgs e) =>
+            PolicyHelp.Text = (PolicyCombo.SelectedItem as Option<MembershipPolicy>)?.Description ?? string.Empty;
+
         private void LookupSearch_TextChanged(object sender, TextChangedEventArgs e) =>
             CollectionViewSource.GetDefaultView(lookupItems).Refresh();
 
@@ -311,7 +318,10 @@ namespace GameRandomiser.UI
                     games = matches.Select(g => g.Id);
                 }
 
-                Result = context.Wheels.CreateWheel(NameBox.Text, games, sort, spec, icon, makeActive: true);
+                var policy = spec == null
+                    ? MembershipPolicy.ManualSnapshot
+                    : (PolicyCombo.SelectedItem as Option<MembershipPolicy>)?.Value ?? MembershipPolicy.ManualSnapshot;
+                Result = context.Wheels.CreateWheel(NameBox.Text, games, sort, spec, icon, makeActive: true, policy: policy);
                 window?.Close();
             }
             catch (ArgumentException ex)

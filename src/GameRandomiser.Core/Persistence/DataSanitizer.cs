@@ -11,6 +11,11 @@ namespace GameRandomiser.Core.Persistence
     /// </summary>
     public static class DataSanitizer
     {
+        private const int MaxErrorLength = 500;
+
+        private static List<Guid> CleanIds(List<Guid> ids) =>
+            (ids ?? new List<Guid>()).Where(id => id != Guid.Empty).Distinct().ToList();
+
         public static RandomiserData Sanitize(RandomiserData data)
         {
             data = data ?? new RandomiserData();
@@ -41,9 +46,52 @@ namespace GameRandomiser.Core.Persistence
                     wheel.SortMode = SortMode.Alphabetical;
                 }
 
+                if (!Enum.IsDefined(typeof(MembershipPolicy), wheel.MembershipPolicy))
+                {
+                    wheel.MembershipPolicy = MembershipPolicy.ManualSnapshot;
+                }
+
                 if (wheel.Population != null)
                 {
-                    wheel.Population.ItemIds = wheel.Population.ItemIds ?? new List<Guid>();
+                    wheel.Population.ItemIds = (wheel.Population.ItemIds ?? new List<Guid>())
+                        .Where(id => id != Guid.Empty)
+                        .Distinct()
+                        .ToList();
+                    var amount = wheel.Population.Amount;
+                    if (amount.HasValue && (double.IsNaN(amount.Value) || double.IsInfinity(amount.Value) || amount.Value < 0))
+                    {
+                        // The rule's default amount is used instead.
+                        wheel.Population.Amount = null;
+                    }
+
+                    if (!Enum.IsDefined(typeof(PopulationSource), wheel.Population.Source))
+                    {
+                        // Unknown rule (hand edit or newer version): keep the games and the criteria text,
+                        // but never evaluate it automatically.
+                        wheel.MembershipPolicy = MembershipPolicy.ManualSnapshot;
+                    }
+                }
+                else
+                {
+                    wheel.MembershipPolicy = MembershipPolicy.ManualSnapshot;
+                }
+
+                wheel.PinnedGameIds = CleanIds(wheel.PinnedGameIds);
+                wheel.ExcludedGameIds = CleanIds(wheel.ExcludedGameIds);
+                if (wheel.RefreshError != null)
+                {
+                    wheel.RefreshError = string.IsNullOrWhiteSpace(wheel.RefreshError)
+                        ? null
+                        : wheel.RefreshError.Length > MaxErrorLength ? wheel.RefreshError.Substring(0, MaxErrorLength) : wheel.RefreshError;
+                }
+
+                if (wheel.Reroll != null)
+                {
+                    wheel.Reroll.Sanitize();
+                    if (wheel.Reroll.IsEmpty)
+                    {
+                        wheel.Reroll = null;
+                    }
                 }
 
                 cleanWheels.Add(wheel);

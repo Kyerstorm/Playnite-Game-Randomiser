@@ -47,6 +47,7 @@ namespace GameRandomiser
             catch (Exception e)
             {
                 Logger.Error(e, "Game Randomiser failed to initialise.");
+                Context.ReportStartupFailure(e);
             }
         }
 

@@ -5,6 +5,7 @@ using System.Linq;
 using System.Windows;
 using System.Windows.Threading;
 using GameRandomiser.Core.Abstractions;
+using GameRandomiser.Core.Diagnostics;
 using GameRandomiser.Core.Models;
 using GameRandomiser.Core.Persistence;
 using GameRandomiser.Core.Population;
@@ -23,11 +24,20 @@ namespace GameRandomiser.Services
     /// </summary>
     public sealed class RandomiserContext : IDisposable
     {
+        /// <summary>Quiet period after the last library event before dynamic wheels are refreshed.</summary>
+        internal static readonly TimeSpan RefreshDebounce = TimeSpan.FromMilliseconds(750);
+
+        private const string SaveFailedNotification = "GameRandomiser_SaveFailed";
+        private const string RefreshNotificationPrefix = "GameRandomiser_Refresh_";
+
         private static readonly ILogger Logger = LogManager.GetLogger();
         private readonly RandomiserSettingsViewModel settingsViewModel;
         private readonly CryptoRandomSource random = new CryptoRandomSource();
+        private readonly ErrorReporter errors = new ErrorReporter();
         private DispatcherTimer libraryDebounce;
         private bool initialized;
+        private bool disposed;
+        private bool saveWarned;
 
         public RandomiserContext(GameRandomiserPlugin plugin, IPlayniteAPI api, RandomiserSettingsViewModel settingsViewModel)
         {
@@ -36,11 +46,17 @@ namespace GameRandomiser.Services
             this.settingsViewModel = settingsViewModel;
 
             Catalog = new PlayniteGameCatalog(api);
-            var store = new ResilientStore(new JsonFileStore(Path.Combine(plugin.GetPluginUserDataPath(), "data.json")), api);
+            var store = new JsonFileStore(Path.Combine(plugin.GetPluginUserDataPath(), "data.json"));
             Wheels = new WheelService(store, Catalog, random);
+            Wheels.SaveFailed += OnSaveFailed;
+            Wheels.Changed += OnWheelsChanged;
             History = new HistoryService(Wheels);
             Randomiser = new RandomiserService(random);
+            Reroll = new RerollProtectionService(Wheels);
             Population = new PopulationEngine(Catalog);
+            Refresh = new RefreshCoordinator(Wheels, Population, Catalog,
+                new DispatcherRefreshScheduler(Dispatcher, RefreshDebounce), random, errors);
+            Refresh.Completed += OnRefreshCompleted;
             Actions = new PlayniteGameActions(api, Catalog);
             Audio = new AudioService();
             Images = new ImageCache();
@@ -53,10 +69,16 @@ namespace GameRandomiser.Services
         public WheelService Wheels { get; }
         public HistoryService History { get; }
         public RandomiserService Randomiser { get; }
+        public RerollProtectionService Reroll { get; }
         public PopulationEngine Population { get; }
+
+        /// <summary>The only route by which dynamic wheels are refreshed.</summary>
+        public RefreshCoordinator Refresh { get; }
+
         public PlayniteGameActions Actions { get; }
         public AudioService Audio { get; }
         public ImageCache Images { get; }
+        public IErrorReporter Errors => errors;
 
         public RandomiserSettings Settings => settingsViewModel.Settings;
 
@@ -97,6 +119,11 @@ namespace GameRandomiser.Services
                 }
             });
 
+            if (Settings.Reroll.ResetBehaviour == RerollResetBehaviour.ResetOnRestart)
+            {
+                SafeRun("reset reroll protection", () => Reroll.ResetAll());
+            }
+
             var defaultWheel = Settings.DefaultWheelId;
             if (defaultWheel.HasValue && Wheels.GetWheel(defaultWheel.Value) != null)
             {
@@ -106,6 +133,24 @@ namespace GameRandomiser.Services
             if (!string.IsNullOrEmpty(Wheels.LoadWarning))
             {
                 Api.Notifications.Add(new NotificationMessage("GameRandomiser_LoadWarning", Wheels.LoadWarning, NotificationType.Error));
+            }
+
+            // The library may have changed while Playnite was closed. Debounced, so startup isn't held up.
+            Refresh.InvalidateAll(RefreshReason.Startup);
+        }
+
+        /// <summary>Records a failure to start up, without stopping Playnite from loading.</summary>
+        internal void ReportStartupFailure(Exception exception)
+        {
+            const string Message = "Game Randomiser could not finish starting up. Your saved wheels have not been changed. Restart Playnite, and check extensions.log if this keeps happening.";
+            errors.Report(new RandomiserError(ErrorCategory.Initialisation, "initialise extension", Message, exception, recovery: "continuing with reduced functionality"));
+            try
+            {
+                Api.Notifications.Add(new NotificationMessage("GameRandomiser_Startup", Message, NotificationType.Error));
+            }
+            catch (Exception e)
+            {
+                Logger.Error(e, "Game Randomiser could not show its startup notification.");
             }
         }
 
@@ -125,11 +170,22 @@ namespace GameRandomiser.Services
         private void OnGamesCollectionChanged(object sender, ItemCollectionChangedEventArgs<Game> e)
         {
             var removed = e.RemovedItems?.Select(g => g.Id).ToList() ?? new List<Guid>();
+            var added = e.AddedItems?.Count ?? 0;
             Dispatcher.BeginInvoke(new Action(() =>
             {
+                if (disposed)
+                {
+                    return;
+                }
+
                 if (removed.Count > 0)
                 {
-                    SafeRun("remove deleted games", () => Wheels.RemoveGamesFromAllWheels(removed));
+                    SafeRun("remove deleted games", () => Wheels.ForgetGames(removed));
+                }
+
+                if (removed.Count > 0 || added > 0)
+                {
+                    Refresh.InvalidateLibrary(LibraryFields.Collection);
                 }
 
                 ScheduleLibraryRefresh();
@@ -140,6 +196,7 @@ namespace GameRandomiser.Services
         {
             var nowHidden = new List<Guid>();
             var relevant = false;
+            var changed = LibraryFields.None;
             foreach (var update in e.UpdatedItems ?? new List<ItemUpdateEvent<Game>>())
             {
                 var oldData = update.OldData;
@@ -164,23 +221,68 @@ namespace GameRandomiser.Services
                 {
                     relevant = true;
                 }
+
+                changed |= ChangedFields(oldData, newData);
             }
 
-            if (nowHidden.Count == 0 && !relevant)
+            if (nowHidden.Count == 0 && !relevant && changed == LibraryFields.None)
             {
                 return;
             }
 
             Dispatcher.BeginInvoke(new Action(() =>
             {
+                if (disposed)
+                {
+                    return;
+                }
+
                 if (nowHidden.Count > 0)
                 {
                     // Keep wheel data clean: hidden games are never eligible.
                     SafeRun("remove hidden games", () => Wheels.RemoveGamesFromAllWheels(nowHidden));
                 }
 
-                ScheduleLibraryRefresh();
+                // Only wheels whose criteria read one of the changed aspects are refreshed.
+                Refresh.InvalidateLibrary(changed);
+                if (nowHidden.Count > 0 || relevant)
+                {
+                    ScheduleLibraryRefresh();
+                }
             }));
+        }
+
+        /// <summary>Which aspects of a game that population rules read are different after an update.</summary>
+        private static LibraryFields ChangedFields(Game before, Game after)
+        {
+            if (before == null)
+            {
+                return LibraryFields.All;
+            }
+
+            var changed = LibraryFields.None;
+            if (before.Hidden != after.Hidden) changed |= LibraryFields.Hidden;
+            if (before.IsInstalled != after.IsInstalled) changed |= LibraryFields.Installed;
+            if (before.Playtime != after.Playtime) changed |= LibraryFields.Playtime;
+            if (before.PlayCount != after.PlayCount || before.LastActivity != after.LastActivity) changed |= LibraryFields.Activity;
+            if (before.CompletionStatusId != after.CompletionStatusId) changed |= LibraryFields.CompletionStatus;
+            if (!SameIds(before.GenreIds, after.GenreIds)) changed |= LibraryFields.Genres;
+            if (!SameIds(before.PlatformIds, after.PlatformIds)) changed |= LibraryFields.Platforms;
+            if (!SameIds(before.TagIds, after.TagIds)) changed |= LibraryFields.Tags;
+            if (!SameIds(before.CategoryIds, after.CategoryIds)) changed |= LibraryFields.Categories;
+            return changed;
+        }
+
+        private static bool SameIds(List<Guid> a, List<Guid> b)
+        {
+            var countA = a?.Count ?? 0;
+            var countB = b?.Count ?? 0;
+            if (countA != countB)
+            {
+                return false;
+            }
+
+            return countA == 0 || new HashSet<Guid>(a).SetEquals(b);
         }
 
         private void ScheduleLibraryRefresh()
@@ -192,6 +294,108 @@ namespace GameRandomiser.Services
 
             libraryDebounce.Stop();
             libraryDebounce.Start();
+        }
+
+        // ---- Refresh and save feedback ----
+
+        /// <summary>Re-evaluates a wheel's criteria now and tells the user what happened.</summary>
+        public void RefreshWheelNow(RandomiserWheel wheel)
+        {
+            if (wheel?.Population != null)
+            {
+                Refresh.InvalidateWheel(wheel.Id, RefreshReason.Manual);
+            }
+        }
+
+        private void OnRefreshCompleted(object sender, RefreshBatchEventArgs e)
+        {
+            foreach (var result in e.Results)
+            {
+                if (result.Kind == RefreshResultKind.Superseded || result.Kind == RefreshResultKind.Skipped)
+                {
+                    continue;
+                }
+
+                var wheel = Wheels.GetWheel(result.WheelId);
+                var notificationId = RefreshNotificationPrefix + result.WheelId;
+                var failed = result.Kind == RefreshResultKind.Failed;
+                if (result.Reason == RefreshReason.Manual)
+                {
+                    // The user asked for this one, so answer directly, once the batch has been applied.
+                    var captured = result;
+                    Dispatcher.BeginInvoke(new Action(() => ShowRefreshSummary(wheel, captured)));
+                }
+                else if (failed)
+                {
+                    // Same id each time: a wheel that keeps failing updates one notification instead of piling them up.
+                    Api.Notifications.Add(new NotificationMessage(notificationId,
+                        $"Game Randomiser, {wheel?.Name ?? "wheel"}: {result.ErrorMessage}", NotificationType.Error));
+                }
+
+                if (!failed)
+                {
+                    Api.Notifications.Remove(notificationId);
+                }
+            }
+        }
+
+        private void ShowRefreshSummary(RandomiserWheel wheel, WheelRefreshResult result)
+        {
+            if (disposed)
+            {
+                return;
+            }
+
+            switch (result.Kind)
+            {
+                case RefreshResultKind.Failed:
+                    Api.Dialogs.ShowErrorMessage(result.ErrorMessage, "Game Randomiser");
+                    break;
+                case RefreshResultKind.Unchanged:
+                    Api.Dialogs.ShowMessage("The wheel is already up to date with its criteria.", "Game Randomiser");
+                    break;
+                case RefreshResultKind.Updated:
+                    var parts = new List<string>();
+                    if (result.Added > 0)
+                    {
+                        parts.Add($"added {Plural(result.Added, "game")}");
+                    }
+
+                    if (result.Removed > 0)
+                    {
+                        parts.Add($"removed {Plural(result.Removed, "game")}");
+                    }
+
+                    Api.Dialogs.ShowMessage(
+                        parts.Count == 0
+                            ? "The wheel was refreshed."
+                            : $"{wheel?.Name ?? "The wheel"} was refreshed: {string.Join(" and ", parts)}.",
+                        "Game Randomiser");
+                    break;
+            }
+        }
+
+        private void OnSaveFailed(object sender, SaveFailedEventArgs e)
+        {
+            errors.Report(new RandomiserError(ErrorCategory.Persistence, "save wheels", UserMessages.SaveFailed, e.Exception,
+                recovery: "kept changes in memory; previous file intact"));
+            if (saveWarned)
+            {
+                return;
+            }
+
+            saveWarned = true;
+            Api.Notifications.Add(new NotificationMessage(SaveFailedNotification, "Game Randomiser: " + UserMessages.SaveFailed, NotificationType.Error));
+        }
+
+        private void OnWheelsChanged(object sender, WheelsChangedEventArgs e)
+        {
+            if (saveWarned && !Wheels.HasUnsavedChanges)
+            {
+                // A later save went through and wrote everything, so the warning no longer applies.
+                saveWarned = false;
+                Api.Notifications.Remove(SaveFailedNotification);
+            }
         }
 
         // ---- Shared interactive flows (used by the sidebar, context menu and main menu) ----
@@ -274,14 +478,14 @@ namespace GameRandomiser.Services
             SafeRun("add games", () =>
             {
                 var result = Wheels.AddGames(wheel.Id, gameIds);
-                if (result.Added == 0 && result.AlreadyPresent > 0 && result.Ineligible == 0)
+                if (result.Added == 0 && result.AlreadyPresent > 0 && result.Ineligible == 0 && result.NotMatching == 0)
                 {
                     var message = gameIds.Count == 1
                         ? $"\"{Catalog.TryGet(gameIds[0])?.Name}\" is already on the {wheel.Name} wheel."
                         : $"All {gameIds.Count} games are already on the {wheel.Name} wheel.";
                     Api.Dialogs.ShowMessage(message, "Game Randomiser");
                 }
-                else if (result.AlreadyPresent > 0 || result.Ineligible > 0)
+                else if (result.AlreadyPresent > 0 || result.Ineligible > 0 || result.NotMatching > 0)
                 {
                     var parts = new List<string> { $"Added {Plural(result.Added, "game")} to {wheel.Name}." };
                     if (result.AlreadyPresent > 0)
@@ -292,6 +496,13 @@ namespace GameRandomiser.Services
                     if (result.Ineligible > 0)
                     {
                         parts.Add($"{Plural(result.Ineligible, "hidden or unavailable game was", "hidden or unavailable games were")} skipped.");
+                    }
+
+                    if (result.NotMatching > 0)
+                    {
+                        parts.Add($"{Plural(result.NotMatching, "game doesn't", "games don't")} match this wheel's criteria and "
+                            + (result.NotMatching == 1 ? "was" : "were")
+                            + " skipped. To add any game, switch the wheel to \"Keep in sync + pinned games\" on the Wheels tab.");
                     }
 
                     Api.Dialogs.ShowMessage(string.Join(" ", parts), "Game Randomiser");
@@ -333,8 +544,9 @@ namespace GameRandomiser.Services
             }
             catch (Exception e)
             {
-                Logger.Error(e, $"Game Randomiser failed to {what}.");
-                Api.Dialogs.ShowErrorMessage($"Game Randomiser couldn't {what}.\n\n{e.Message}", "Game Randomiser");
+                var message = $"Game Randomiser couldn't {what}.\n\n{e.Message}\n\nYour saved wheels have not been changed. Technical details are in Playnite's extensions.log.";
+                errors.Report(new RandomiserError(ErrorCategory.General, what, message, e));
+                Api.Dialogs.ShowErrorMessage(message, "Game Randomiser");
             }
         }
 
@@ -343,6 +555,7 @@ namespace GameRandomiser.Services
 
         public void Dispose()
         {
+            disposed = true;
             try
             {
                 if (initialized)
@@ -357,6 +570,9 @@ namespace GameRandomiser.Services
             }
 
             libraryDebounce?.Stop();
+            Refresh.Dispose();
+            Wheels.SaveFailed -= OnSaveFailed;
+            Wheels.Changed -= OnWheelsChanged;
             Audio.Dispose();
             random.Dispose();
         }
@@ -372,37 +588,19 @@ namespace GameRandomiser.Services
             public Guid WheelId { get; }
         }
 
-        /// <summary>Never lets a disk error escape into the UI; the data stays in memory and is retried on the next change.</summary>
-        private sealed class ResilientStore : IRandomiserStore
+        /// <summary>Writes one structured line per failure to Playnite's log. User feedback is the caller's job.</summary>
+        private sealed class ErrorReporter : IErrorReporter
         {
-            private readonly IRandomiserStore inner;
-            private readonly IPlayniteAPI api;
-            private bool warned;
-
-            public ResilientStore(IRandomiserStore inner, IPlayniteAPI api)
+            public void Report(RandomiserError error)
             {
-                this.inner = inner;
-                this.api = api;
-            }
-
-            public StoreLoadResult Load() => inner.Load();
-
-            public void Save(RandomiserData data)
-            {
-                try
+                var line = "Game Randomiser " + error.ToLogString();
+                if (error.Exception != null)
                 {
-                    inner.Save(data);
-                    warned = false;
+                    Logger.Error(error.Exception, line);
                 }
-                catch (Exception e)
+                else
                 {
-                    Logger.Error(e, "Game Randomiser failed to save its data.");
-                    if (!warned)
-                    {
-                        warned = true;
-                        api.Notifications.Add(new NotificationMessage("GameRandomiser_SaveFailed",
-                            $"Game Randomiser couldn't save your wheels: {e.Message}", NotificationType.Error));
-                    }
+                    Logger.Error(line);
                 }
             }
         }

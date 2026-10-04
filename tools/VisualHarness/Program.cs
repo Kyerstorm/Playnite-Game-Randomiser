@@ -13,6 +13,7 @@ using System.Windows.Threading;
 using GameRandomiser;
 using GameRandomiser.Core.Animation;
 using GameRandomiser.Core.Models;
+using GameRandomiser.Core.Services;
 using GameRandomiser.UI;
 using Moq;
 using Playnite.SDK;
@@ -57,6 +58,14 @@ namespace GameRandomiser.VisualHarness
             catch (Exception e)
             {
                 Log.Add("FAILED: " + e);
+                exitCode = 1;
+            }
+
+            // A failed check or a broken binding fails the run, so CI can gate on this tool.
+            var problems = Log.Count(l => l.StartsWith("FAIL") || l.StartsWith("BINDING ERROR"));
+            Log.Add($"{Log.Count(l => l.StartsWith("PASS"))} checks passed, {problems} problems.");
+            if (problems > 0)
+            {
                 exitCode = 1;
             }
 
@@ -297,12 +306,401 @@ namespace GameRandomiser.VisualHarness
             Check("hidden game not resolved", ctx.Wheels.ResolveEntries(backlog.Id).All(g => g.Id != toHide.Id));
             Check("cleanup removes hidden", ctx.Wheels.CleanupInvalidEntries() >= 1);
 
+            DynamicWheels(plugin, games);
+            RerollProtection(plugin, rpgs, single);
+            SaveFailure(plugin, api, dataRoot, backlog);
+            Shutdown(plugin, games);
+            LargeLibrary();
+
             Log.Add("Screenshots written to " + outputDir);
+        }
+
+        // ---------- reliability scenarios ----------
+
+        /// <summary>10. Dynamic wheels follow the library through Playnite's own change events.</summary>
+        private static void DynamicWheels(GameRandomiserPlugin plugin, List<Game> games)
+        {
+            var ctx = plugin.Context;
+            var spec = new PopulationSpec { Source = PopulationSource.NeverPlayed };
+            spec.Description = ctx.Population.Describe(spec);
+            var matches = ctx.Population.Evaluate(spec).Select(g => g.Id).ToList();
+            var snapshot = ctx.Wheels.CreateWheel("Unplayed (snapshot)", matches, SortMode.Alphabetical, spec, "📚", false);
+            var strict = ctx.Wheels.CreateWheel("Unplayed (auto)", matches, SortMode.Alphabetical, spec, "🎯", true, MembershipPolicy.StrictCriteria);
+            Pump(RefreshWait);
+            Check("dynamic wheel: refreshed after creation", ctx.Wheels.GetRefreshInfo(strict.Id).Status == RefreshStatus.Refreshed);
+
+            // A game gets played: it must leave the strict wheel, and a burst of events must cost one refresh.
+            var played = games.First(g => strict.GameIds.Contains(g.Id));
+            var before = Copy(played);
+            played.Playtime = 7200;
+            played.PlayCount = 1;
+            played.LastActivity = DateTime.Now;
+            var batches = ctx.Refresh.BatchesStarted;
+            var writes = DataFileStamp(plugin);
+            for (var i = 0; i < 40; i++)
+            {
+                RaiseUpdated(before, played);
+            }
+
+            Pump(RefreshWait);
+            Check("dynamic wheel: played game left the strict wheel", !ctx.Wheels.GetWheel(strict.Id).GameIds.Contains(played.Id));
+            Check("dynamic wheel: 40 library events were coalesced into one refresh", ctx.Refresh.BatchesStarted == batches + 1);
+            Check("dynamic wheel: snapshot wheel was left alone", ctx.Wheels.GetWheel(snapshot.Id).GameIds.Contains(played.Id));
+            Check("dynamic wheel: change was saved", DataFileStamp(plugin) != writes);
+
+            // An unrelated change (cover art) must not trigger a refresh at all.
+            var other = games.First(g => strict.GameIds.Contains(g.Id));
+            var otherBefore = Copy(other);
+            other.BackgroundImage = "changed.png";
+            batches = ctx.Refresh.BatchesStarted;
+            RaiseUpdated(otherBefore, other);
+            Pump(RefreshWait);
+            Check("dynamic wheel: unrelated metadata change does not refresh", ctx.Refresh.BatchesStarted == batches);
+
+            // A new unplayed game arrives: the strict wheel gains it, the snapshot only on a manual refresh.
+            var added = new Game("Brand New Unplayed Game") { IsInstalled = true };
+            games.Add(added);
+            GamesMock.Raise(c => c.ItemCollectionChanged += null, GamesMock.Object,
+                new ItemCollectionChangedEventArgs<Game>(new List<Game> { added }, new List<Game>()));
+            Pump(RefreshWait);
+            Check("dynamic wheel: new matching game joined the strict wheel", ctx.Wheels.GetWheel(strict.Id).GameIds.Contains(added.Id));
+            Check("dynamic wheel: snapshot wheel did not change by itself", !ctx.Wheels.GetWheel(snapshot.Id).GameIds.Contains(added.Id));
+
+            ctx.RefreshWheelNow(ctx.Wheels.GetWheel(snapshot.Id));
+            Pump(RefreshWait);
+            Check("manual refresh: snapshot wheel gained the new game", ctx.Wheels.GetWheel(snapshot.Id).GameIds.Contains(added.Id));
+            Check("manual refresh: kept games that no longer match", ctx.Wheels.GetWheel(snapshot.Id).GameIds.Contains(played.Id));
+            Check("manual refresh: user was told the outcome", Log.Any(l => l.StartsWith("dialog:") && l.Contains("was refreshed")));
+
+            // Criteria + pinned: a pinned game stays when it stops matching; a removed game stays removed.
+            ctx.Wheels.SetMembershipPolicy(strict.Id, MembershipPolicy.CriteriaPlusPinned);
+            Pump(RefreshWait);
+            var current = ctx.Wheels.GetWheel(strict.Id);
+            var pinned = games.First(g => current.GameIds.Contains(g.Id) && g.Id != added.Id);
+            var removedByUser = games.First(g => current.GameIds.Contains(g.Id) && g.Id != added.Id && g.Id != pinned.Id);
+            ctx.Wheels.PinGames(strict.Id, new[] { pinned.Id });
+            ctx.Wheels.RemoveGames(strict.Id, new[] { removedByUser.Id });
+            var pinnedBefore = Copy(pinned);
+            pinned.Playtime = 3600;
+            pinned.PlayCount = 1;
+            RaiseUpdated(pinnedBefore, pinned);
+            Pump(RefreshWait);
+            current = ctx.Wheels.GetWheel(strict.Id);
+            Check("pinned: pinned game stays after it stops matching", current.GameIds.Contains(pinned.Id));
+            Check("pinned: a game the user removed does not come back", !current.GameIds.Contains(removedByUser.Id));
+
+            var window = CreateWindow(1200, 800);
+            var view = Show(window, plugin);
+            var vm = (SidebarViewModel)view.DataContext;
+            Check("dynamic wheel: wheel tab shows the auto badge", vm.DynamicBadgeText == "auto" && view.DynamicBadge.Visibility == Visibility.Visible);
+            Shoot(window, "22-dynamic-wheel");
+            view.SelectTab(SidebarTab.Manage);
+            Pump(TimeSpan.FromMilliseconds(300));
+            Check("dynamic wheel: refresh status is shown", view.RefreshStatus.Visibility == Visibility.Visible && view.RefreshStatus.Text.Contains("Up to date"));
+            Check("dynamic wheel: removed games can be restored", vm.CanRestoreRemoved && vm.RemovedCount == 1);
+            Shoot(window, "23-dynamic-manage");
+            Close(window, view);
+
+            // A refresh that fails keeps the last good list and says so.
+            var good = ctx.Wheels.GetWheel(strict.Id).GameIds.ToList();
+            FailLibraryReads = true;
+            ctx.Refresh.InvalidateAll(RefreshReason.LibraryChanged);
+            Pump(RefreshWait);
+            FailLibraryReads = false;
+            var info = ctx.Wheels.GetRefreshInfo(strict.Id);
+            Check("failed refresh: last known good games are kept", ctx.Wheels.GetWheel(strict.Id).GameIds.SequenceEqual(good));
+            Check("failed refresh: wheel is marked stale", info.Status == RefreshStatus.FailedUsingLastKnownGood && info.IsStale);
+            Check("failed refresh: user was notified", Notifications.Any(n => n.Type == NotificationType.Error && n.Text.Contains("Unplayed (auto)")));
+            Check("failed refresh: no stack trace in the message", Notifications.All(n => !n.Text.Contains("   at ")));
+            window = CreateWindow(900, 800);
+            view = Show(window, plugin);
+            Shoot(window, "24-dynamic-stale");
+            Close(window, view);
+
+            ctx.Refresh.InvalidateAll(RefreshReason.LibraryChanged);
+            Pump(RefreshWait);
+            Check("failed refresh: recovers on the next refresh", ctx.Wheels.GetRefreshInfo(strict.Id).Status == RefreshStatus.Refreshed
+                && Notifications.All(n => !n.Text.Contains("Unplayed (auto)")));
+        }
+
+        /// <summary>11. Reroll protection: exclusion, reroll limit, accept and the single-game bypass.</summary>
+        private static void RerollProtection(GameRandomiserPlugin plugin, RandomiserWheel wheel, RandomiserWheel single)
+        {
+            var ctx = plugin.Context;
+            ctx.Settings.WinnerBehaviour = WinnerBehaviour.KeepGame;
+            ctx.Settings.SpinDurationSeconds = 2;
+            ctx.Settings.Reroll.Enabled = true;
+            ctx.Settings.Reroll.Exclusion = RerollExclusionMode.PreviousWinner;
+            ctx.Settings.Reroll.LimitRerolls = true;
+            ctx.Settings.Reroll.MaxRerolls = 2;
+            ctx.OnSettingsSaved();
+            ctx.Wheels.SetActiveWheel(wheel.Id);
+            ctx.Reroll.Reset(wheel.Id);
+
+            var window = CreateWindow(1000, 820);
+            var view = Show(window, plugin);
+            var vm = (SidebarViewModel)view.DataContext;
+            var winners = new List<Guid>();
+            var spins = 0;
+            while (vm.CanSpin && spins < 6)
+            {
+                Click(view.SpinButton);
+                Pump(TimeSpan.FromSeconds(3.2));
+                winners.Add(ctx.History.GetHistory(wheel.Id).First().GameId);
+                spins++;
+                if (spins == 1)
+                {
+                    Check("reroll protection: winner card explains the next spin", !string.IsNullOrEmpty(vm.Winner?.ProtectionText));
+                    Shoot(window, "25-reroll-winner-card");
+                }
+
+                if (vm.CanSpin)
+                {
+                    vm.HideWinner();
+                    Pump(TimeSpan.FromMilliseconds(50));
+                }
+            }
+
+            Check("reroll protection: 1 spin + 2 rerolls, then blocked", spins == 3 && !vm.CanSpin);
+            Check("reroll protection: never the same game twice in a row", Enumerable.Range(1, winners.Count - 1).All(i => winners[i] != winners[i - 1]));
+            Check("reroll protection: blocked state is explained", vm.IsSpinBlocked && !string.IsNullOrEmpty(vm.ProtectionStatusText)
+                && vm.Winner != null && !vm.Winner.CanSpinAgain && vm.Winner.CanAccept);
+            Check("reroll protection: spin button is disabled", !view.SpinButton.IsEnabled);
+            Shoot(window, "26-reroll-limit-card");
+            vm.HideWinner();
+            Pump(TimeSpan.FromMilliseconds(400));
+            Check("reroll protection: status line visible under the spin button", view.ProtectionBar.Visibility == Visibility.Visible);
+            Shoot(window, "27-reroll-limit-status");
+
+            var historyBefore = ctx.History.GetHistory(wheel.Id).Count;
+            // The button is disabled; clicking the wheel itself goes through the same gate.
+            Check("reroll protection: a blocked spin is refused", vm.BeginSpin(view.Wheel.Rotation) == null);
+            Pump(TimeSpan.FromMilliseconds(300));
+            Check("reroll protection: a blocked spin does nothing", ctx.History.GetHistory(wheel.Id).Count == historyBefore && !vm.IsSpinning);
+
+            vm.AcceptPick();
+            Pump(TimeSpan.FromMilliseconds(100));
+            Check("reroll protection: accepting the pick allows spinning again", vm.CanSpin);
+            Close(window, view);
+
+            // State is persisted per wheel and survives a restart when asked to.
+            ctx.Settings.Reroll.ResetBehaviour = RerollResetBehaviour.KeepUntilReset;
+            Check("reroll protection: recent winner is persisted", ctx.Wheels.GetWheel(wheel.Id).Reroll?.RecentWinnerIds.Count > 0);
+
+            // A one-game wheel can always spin.
+            single = ctx.Wheels.CreateWheel("Only one", new[] { ctx.Wheels.GetWheel(wheel.Id).GameIds[0] }, icon: "🎯");
+            window = CreateWindow(900, 800);
+            view = Show(window, plugin);
+            vm = (SidebarViewModel)view.DataContext;
+            var singleBefore = ctx.History.GetHistory(single.Id).Count;
+            for (var i = 0; i < 2 && vm.CanSpin; i++)
+            {
+                Click(view.SpinButton);
+                Pump(TimeSpan.FromSeconds(2.2));
+                vm.HideWinner();
+                Pump(TimeSpan.FromMilliseconds(50));
+            }
+
+            Check("reroll protection: single-game wheel still spins", ctx.History.GetHistory(single.Id).Count == singleBefore + 2);
+            Close(window, view);
+
+            // Settings page with the section enabled, light and dark.
+            foreach (var theme in new[] { (ThemeMode.Dark, "28-settings-reroll"), (ThemeMode.Light, "29-settings-reroll-light") })
+            {
+                window = CreateWindow(820, 1700, theme.Item1 == ThemeMode.Light ? Colors.White : (Color?)null);
+                var settingsVm = (GameRandomiser.Settings.RandomiserSettingsViewModel)plugin.GetSettings(false);
+                settingsVm.BeginEdit();
+                settingsVm.RerollEnabled = true;
+                settingsVm.RecentWinnerCount = 4;
+                window.Content = plugin.GetSettingsView(false);
+                if (theme.Item1 == ThemeMode.Light)
+                {
+                    window.Foreground = Brushes.Black;
+                }
+
+                window.Show();
+                Pump(TimeSpan.FromMilliseconds(500));
+                Shoot(window, theme.Item2);
+                // Saving goes through Playnite itself (not available here), so cancel and check the round trip.
+                var edited = ctx.Settings.Reroll.RecentWinnerCount;
+                settingsVm.CancelEdit();
+                if (theme.Item1 == ThemeMode.Dark)
+                {
+                    Check("settings: reroll edits reach the settings and cancel restores them", edited == 4 && ctx.Settings.Reroll.RecentWinnerCount == 3);
+                }
+
+                window.Close();
+            }
+
+            ctx.Settings.Reroll.Enabled = false;
+            ctx.Settings.WinnerBehaviour = WinnerBehaviour.AskMe;
+            ctx.OnSettingsSaved();
+            ctx.Wheels.SetActiveWheel(wheel.Id);
+            window = CreateWindow(900, 800);
+            view = Show(window, plugin);
+            vm = (SidebarViewModel)view.DataContext;
+            Check("reroll protection off: no status, spinning unrestricted", vm.CanSpin && !vm.HasProtectionStatus && view.ProtectionBar.Visibility != Visibility.Visible);
+            Close(window, view);
+        }
+
+        /// <summary>12. A failed save keeps the change in memory, tells the user once and recovers.</summary>
+        private static void SaveFailure(GameRandomiserPlugin plugin, IPlayniteAPI api, string dataRoot, RandomiserWheel wheel)
+        {
+            var ctx = plugin.Context;
+            var dataFile = Directory.GetFiles(dataRoot, "data.json", SearchOption.AllDirectories).Single();
+            var original = File.ReadAllText(dataFile);
+            Notifications.Clear();
+            using (new FileStream(dataFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                ctx.Wheels.RenameWheel(wheel.Id, "Backlog (renamed)");
+                ctx.Wheels.SetWheelIcon(wheel.Id, "🚀");
+            }
+
+            Check("save failure: change kept in memory", ctx.Wheels.GetWheel(wheel.Id).Name == "Backlog (renamed)" && ctx.Wheels.HasUnsavedChanges);
+            Check("save failure: file on disk is intact", File.ReadAllText(dataFile) == original);
+            Check("save failure: user notified exactly once", Notifications.Count(n => n.Type == NotificationType.Error) == 1);
+
+            ctx.Wheels.SetWheelIcon(wheel.Id, "🎲");
+            Check("save failure: next save succeeds and clears the warning", !ctx.Wheels.HasUnsavedChanges && Notifications.Count == 0);
+            var reloaded = new GameRandomiserPlugin(api);
+            Check("save failure: recovered data round-trips", reloaded.Context.Wheels.GetWheel(wheel.Id)?.Name == "Backlog (renamed)");
+            Check("no temp files left behind", Directory.GetFiles(Path.GetDirectoryName(dataFile), "*.tmp").Length == 0);
+        }
+
+        /// <summary>13. After shutdown, late library events are ignored and nothing throws.</summary>
+        private static void Shutdown(GameRandomiserPlugin plugin, List<Game> games)
+        {
+            var ctx = plugin.Context;
+            var window = CreateWindow(900, 800);
+            var view = Show(window, plugin);
+            var game = games.First(g => !g.Hidden);
+            var before = Copy(game);
+            game.Playtime += 60;
+            RaiseUpdated(before, game); // a refresh is now pending
+            plugin.OnApplicationStopped(new Playnite.SDK.Events.OnApplicationStoppedEventArgs());
+            var batches = ctx.Refresh.BatchesStarted;
+            var stamp = DataFileStamp(plugin);
+            RaiseUpdated(before, game);
+            Pump(RefreshWait);
+            Check("shutdown: pending and late refreshes are dropped", ctx.Refresh.BatchesStarted == batches && DataFileStamp(plugin) == stamp);
+            Close(window, view);
+            plugin.OnApplicationStopped(new Playnite.SDK.Events.OnApplicationStoppedEventArgs());
+            Check("shutdown: disposing twice is harmless", true);
+        }
+
+        /// <summary>14. A 10,000-game library: refreshes must not stall the UI thread.</summary>
+        private static void LargeLibrary()
+        {
+            var dataRoot = Path.Combine(Path.GetTempPath(), "GameRandomiserHarness", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dataRoot);
+            var games = new List<Game>();
+            for (var i = 0; i < 10000; i++)
+            {
+                games.Add(new Game($"Library Game {i:00000}")
+                {
+                    IsInstalled = i % 3 == 0,
+                    Playtime = (ulong)(i % 4 == 0 ? 0 : 3600 * (i % 50 + 1)),
+                    PlayCount = (ulong)(i % 4 == 0 ? 0 : 1)
+                });
+            }
+
+            var plugin = new GameRandomiserPlugin(CreateApi(games, dataRoot));
+            plugin.OnApplicationStarted(new Playnite.SDK.Events.OnApplicationStartedEventArgs());
+            var ctx = plugin.Context;
+            RandomiserWheel first = null;
+            foreach (var source in new[] { PopulationSource.NeverPlayed, PopulationSource.Installed, PopulationSource.Played, PopulationSource.NotInstalled })
+            {
+                var spec = new PopulationSpec { Source = source };
+                spec.Description = ctx.Population.Describe(spec);
+                var wheel = ctx.Wheels.CreateWheel(spec.Description, null, SortMode.Alphabetical, spec, null, first == null, MembershipPolicy.StrictCriteria);
+                first = first ?? wheel;
+            }
+
+            // Watch for UI-thread stalls while the four wheels are populated from 10,000 games.
+            var longestGap = TimeSpan.Zero;
+            var clock = Stopwatch.StartNew();
+            var last = clock.Elapsed;
+            var heartbeat = new DispatcherTimer(DispatcherPriority.Normal) { Interval = TimeSpan.FromMilliseconds(10) };
+            heartbeat.Tick += (s, e) =>
+            {
+                var now = clock.Elapsed;
+                if (now - last > longestGap)
+                {
+                    longestGap = now - last;
+                }
+
+                last = now;
+            };
+            heartbeat.Start();
+            ctx.Refresh.InvalidateAll(RefreshReason.Startup); // what happens when Playnite starts with these wheels saved
+            Pump(TimeSpan.FromSeconds(3));
+            var populated = ctx.Wheels.Wheels.Sum(w => w.GameIds.Count);
+            Check($"10k library: four dynamic wheels populated ({populated} entries)", ctx.Wheels.GetWheel(first.Id).GameIds.Count == 2500 && populated == 20000);
+            Log.Add($"INFO  10k library: longest UI-thread gap while populating 4 wheels = {longestGap.TotalMilliseconds:0} ms");
+            Budget("10k library: UI thread stayed responsive while populating (< 400 ms gap)", longestGap < TimeSpan.FromMilliseconds(400));
+
+            // One game changes: only the wheels that read playtime are re-evaluated, and nothing stalls.
+            longestGap = TimeSpan.Zero;
+            last = clock.Elapsed;
+            var game = games[0];
+            var before = Copy(game);
+            game.Playtime = 7200;
+            game.PlayCount = 1;
+            RaiseUpdated(before, game);
+            Pump(RefreshWait);
+            heartbeat.Stop();
+            Check("10k library: single change reconciled", ctx.Wheels.GetWheel(first.Id).GameIds.Count == 2499);
+            Log.Add($"INFO  10k library: longest UI-thread gap for a one-game change = {longestGap.TotalMilliseconds:0} ms");
+            Budget("10k library: UI thread stayed responsive on change (< 250 ms gap)", longestGap < TimeSpan.FromMilliseconds(250));
+
+            var timer = Stopwatch.StartNew();
+            var window = CreateWindow(1000, 820);
+            var view = Show(window, plugin);
+            Log.Add($"INFO  10k library: showing a 2,499-game wheel took {timer.ElapsedMilliseconds - 400} ms (excluding the 400 ms settle)");
+            Shoot(window, "30-large-library-wheel");
+            Close(window, view);
+            plugin.OnApplicationStopped(new Playnite.SDK.Events.OnApplicationStoppedEventArgs());
+        }
+
+        private static readonly TimeSpan RefreshWait = TimeSpan.FromMilliseconds(1500);
+        private static readonly List<NotificationMessage> Notifications = new List<NotificationMessage>();
+        private static Mock<IItemCollection<Game>> GamesMock;
+        private static bool FailLibraryReads;
+
+        private static Game Copy(Game game) => new Game(game.Name)
+        {
+            Id = game.Id,
+            Hidden = game.Hidden,
+            IsInstalled = game.IsInstalled,
+            Playtime = game.Playtime,
+            PlayCount = game.PlayCount,
+            LastActivity = game.LastActivity,
+            CoverImage = game.CoverImage,
+            Icon = game.Icon,
+            BackgroundImage = game.BackgroundImage
+        };
+
+        private static void RaiseUpdated(Game before, Game after) =>
+            GamesMock.Raise(c => c.ItemUpdated += null, GamesMock.Object,
+                new ItemUpdatedEventArgs<Game>(new List<ItemUpdateEvent<Game>> { new ItemUpdateEvent<Game>(before, after) }));
+
+        /// <summary>Changes whenever the data file is rewritten.</summary>
+        private static string DataFileStamp(GameRandomiserPlugin plugin)
+        {
+            var file = new FileInfo(Path.Combine(plugin.GetPluginUserDataPath(), "data.json"));
+            return file.Exists ? file.LastWriteTimeUtc.Ticks + ":" + file.Length : "missing";
         }
 
         // ---------- helpers ----------
 
         private static void Check(string what, bool ok) => Log.Add((ok ? "PASS  " : "FAIL  ") + what);
+
+        /// <summary>
+        /// A timing budget. Shared CI runners are too noisy to gate on wall-clock time, so there a miss
+        /// is reported as a warning; on a developer machine it fails the run.
+        /// </summary>
+        private static void Budget(string what, bool ok) =>
+            Log.Add((ok ? "PASS  " : Environment.GetEnvironmentVariable("CI") == "true" ? "WARN  " : "FAIL  ") + what);
 
         /// <summary>Runs <paramref name="interact"/> against the next modal dialog hosting a <typeparamref name="T"/>.</summary>
         private static void OnDialog<T>(Action<Window, T> interact) where T : FrameworkElement
@@ -472,7 +870,25 @@ namespace GameRandomiser.VisualHarness
         {
             var gamesCollection = new Mock<IItemCollection<Game>>();
             gamesCollection.Setup(c => c.Get(It.IsAny<Guid>())).Returns((Guid id) => games.FirstOrDefault(g => g.Id == id));
-            gamesCollection.Setup(c => c.GetEnumerator()).Returns(() => games.ToList().GetEnumerator());
+            gamesCollection.Setup(c => c.GetEnumerator()).Returns(() =>
+            {
+                if (FailLibraryReads)
+                {
+                    throw new InvalidOperationException("Simulated library failure.");
+                }
+
+                return games.ToList().GetEnumerator();
+            });
+            GamesMock = gamesCollection;
+
+            var notifications = new Mock<INotificationsAPI>();
+            notifications.Setup(n => n.Add(It.IsAny<NotificationMessage>())).Callback((NotificationMessage m) =>
+            {
+                Notifications.RemoveAll(x => x.Id == m.Id);
+                Notifications.Add(m);
+                Log.Add("notification: " + m.Text.Replace("\n", " "));
+            });
+            notifications.Setup(n => n.Remove(It.IsAny<string>())).Callback((string id) => Notifications.RemoveAll(x => x.Id == id));
             gamesCollection.Setup(c => c.Count).Returns(() => games.Count);
             gamesCollection.Setup(c => c.CopyTo(It.IsAny<Game[]>(), It.IsAny<int>())).Callback((Game[] a, int i) => games.CopyTo(a, i));
 
@@ -530,6 +946,7 @@ namespace GameRandomiser.VisualHarness
             api.Setup(a => a.Paths).Returns(paths.Object);
             api.Setup(a => a.MainView).Returns(mainView.Object);
             api.Setup(a => a.ApplicationInfo).Returns(info.Object);
+            api.Setup(a => a.Notifications).Returns(notifications.Object);
             return api.Object;
         }
     }

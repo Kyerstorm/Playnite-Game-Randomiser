@@ -40,6 +40,35 @@ namespace GameRandomiser.Core.Services
             return SpinPlanner.Plan(segmentCount, winner, currentRotation, options, random);
         }
 
+        /// <summary>
+        /// Uniformly selects one of <paramref name="eligibleIndices"/>. The eligibility stage decides who
+        /// is in the list; this stage gives every listed candidate exactly 1/count probability.
+        /// </summary>
+        public int PickWinnerIndex(IReadOnlyList<int> eligibleIndices)
+        {
+            if (eligibleIndices == null || eligibleIndices.Count == 0)
+            {
+                throw new InvalidOperationException("Cannot pick a winner: no eligible candidates.");
+            }
+
+            return eligibleIndices[random.NextInt(eligibleIndices.Count)];
+        }
+
+        /// <summary>
+        /// Picks a winner from the eligible segments only, then plans the rotation over the whole wheel.
+        /// Excluded segments stay visible on the wheel but can never be landed on.
+        /// </summary>
+        public SpinPlan PlanSpin(int segmentCount, IReadOnlyList<int> eligibleIndices, double currentRotation, SpinOptions options)
+        {
+            var winner = PickWinnerIndex(eligibleIndices);
+            if (winner < 0 || winner >= segmentCount)
+            {
+                throw new InvalidOperationException("An eligible candidate is not on the wheel.");
+            }
+
+            return SpinPlanner.Plan(segmentCount, winner, currentRotation, options, random);
+        }
+
         /// <summary>Unbiased Fisher-Yates shuffle.</summary>
         public void Shuffle<T>(IList<T> items) => ShuffleInPlace(items, random);
 

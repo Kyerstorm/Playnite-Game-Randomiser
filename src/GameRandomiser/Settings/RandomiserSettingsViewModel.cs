@@ -103,6 +103,97 @@ namespace GameRandomiser.Settings
 
         public string VolumeText => Settings.Volume + "%";
 
+        // ---- Reroll protection ----
+        // Wrapped rather than bound straight to Settings.Reroll so dependent controls enable and
+        // disable as the options change.
+
+        public bool RerollEnabled
+        {
+            get => Settings.Reroll.Enabled;
+            set { Settings.Reroll.Enabled = value; RaiseReroll(); }
+        }
+
+        public RerollExclusionMode RerollExclusion
+        {
+            get => Settings.Reroll.Exclusion;
+            set { Settings.Reroll.Exclusion = value; RaiseReroll(); }
+        }
+
+        public int RecentWinnerCount
+        {
+            get => Settings.Reroll.RecentWinnerCount;
+            set { Settings.Reroll.RecentWinnerCount = value; RaiseReroll(); }
+        }
+
+        public bool LimitRerolls
+        {
+            get => Settings.Reroll.LimitRerolls;
+            set { Settings.Reroll.LimitRerolls = value; RaiseReroll(); }
+        }
+
+        public int MaxRerolls
+        {
+            get => Settings.Reroll.MaxRerolls;
+            set { Settings.Reroll.MaxRerolls = value; RaiseReroll(); }
+        }
+
+        public bool RerollCooldownEnabled
+        {
+            get => Settings.Reroll.CooldownEnabled;
+            set { Settings.Reroll.CooldownEnabled = value; RaiseReroll(); }
+        }
+
+        public int RerollCooldownMinutes
+        {
+            get => Settings.Reroll.CooldownMinutes;
+            set { Settings.Reroll.CooldownMinutes = value; RaiseReroll(); }
+        }
+
+        public RerollResetBehaviour RerollReset
+        {
+            get => Settings.Reroll.ResetBehaviour;
+            set { Settings.Reroll.ResetBehaviour = value; RaiseReroll(); }
+        }
+
+        public string RecentWinnerCountText => Services.RandomiserContext.Plural(Settings.Reroll.RecentWinnerCount, "winner");
+        public string MaxRerollsText => Services.RandomiserContext.Plural(Settings.Reroll.MaxRerolls, "reroll");
+        public string RerollCooldownText => Services.RandomiserContext.Plural(Settings.Reroll.CooldownMinutes, "minute");
+
+        public bool CanEditRecentWinnerCount => RerollEnabled && RerollExclusion == RerollExclusionMode.RecentWinners;
+        public bool CanEditRerollLimit => RerollEnabled && LimitRerolls;
+        public bool CanEditRerollCooldown => RerollEnabled && LimitRerolls && RerollCooldownEnabled;
+
+        public IReadOnlyList<Option<RerollExclusionMode>> ExclusionOptions { get; } = new[]
+        {
+            new Option<RerollExclusionMode>(RerollExclusionMode.None, "Don't skip anyone"),
+            new Option<RerollExclusionMode>(RerollExclusionMode.PreviousWinner, "Skip the previous winner"),
+            new Option<RerollExclusionMode>(RerollExclusionMode.RecentWinners, "Skip recent winners")
+        };
+
+        public IReadOnlyList<Option<RerollResetBehaviour>> RerollResetOptions { get; } = new[]
+        {
+            new Option<RerollResetBehaviour>(RerollResetBehaviour.ResetOnRestart, "When Playnite restarts"),
+            new Option<RerollResetBehaviour>(RerollResetBehaviour.KeepUntilReset, "Only when I reset it")
+        };
+
+        private void RaiseReroll()
+        {
+            OnPropertyChanged(nameof(RerollEnabled));
+            OnPropertyChanged(nameof(RerollExclusion));
+            OnPropertyChanged(nameof(RecentWinnerCount));
+            OnPropertyChanged(nameof(RecentWinnerCountText));
+            OnPropertyChanged(nameof(LimitRerolls));
+            OnPropertyChanged(nameof(MaxRerolls));
+            OnPropertyChanged(nameof(MaxRerollsText));
+            OnPropertyChanged(nameof(RerollCooldownEnabled));
+            OnPropertyChanged(nameof(RerollCooldownMinutes));
+            OnPropertyChanged(nameof(RerollCooldownText));
+            OnPropertyChanged(nameof(RerollReset));
+            OnPropertyChanged(nameof(CanEditRecentWinnerCount));
+            OnPropertyChanged(nameof(CanEditRerollLimit));
+            OnPropertyChanged(nameof(CanEditRerollCooldown));
+        }
+
         public DelegateCommand AddColourCommand { get; }
         public DelegateCommand RemoveColourCommand { get; }
         public DelegateCommand ResetColoursCommand { get; }
@@ -252,6 +343,7 @@ namespace GameRandomiser.Settings
             OnPropertyChanged(nameof(SpinDurationText));
             OnPropertyChanged(nameof(Volume));
             OnPropertyChanged(nameof(VolumeText));
+            RaiseReroll();
         }
     }
 }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using GameRandomiser.Core.Abstractions;
+using GameRandomiser.Core.Diagnostics;
 using GameRandomiser.Core.Layout;
 using GameRandomiser.Core.Models;
 using GameRandomiser.Core.Persistence;
@@ -29,7 +30,11 @@ namespace GameRandomiser.Core.Tests
 
         public GameInfo TryGet(Guid gameId) => games.TryGetValue(gameId, out var g) ? g : null;
 
-        public IReadOnlyList<GameInfo> GetAllGames() => games.Values.ToList();
+        /// <summary>Simulates a library that cannot be read.</summary>
+        public bool FailReads { get; set; }
+
+        public IReadOnlyList<GameInfo> GetAllGames() =>
+            FailReads ? throw new InvalidOperationException("The library is unavailable.") : games.Values.ToList();
 
         public IReadOnlyList<GameInfo> GetFilteredGames() => Filtered;
 
@@ -49,6 +54,122 @@ namespace GameRandomiser.Core.Tests
             Saved = data;
             SaveCount++;
         }
+    }
+
+    /// <summary>A store whose writes can be made to fail, to exercise save-failure recovery.</summary>
+    internal sealed class FlakyStore : IRandomiserStore
+    {
+        public bool Fail { get; set; }
+        public int SaveCount { get; private set; }
+        public int Attempts { get; private set; }
+        public RandomiserData Saved { get; private set; }
+
+        public StoreLoadResult Load() => new StoreLoadResult(new RandomiserData());
+
+        public void Save(RandomiserData data)
+        {
+            Attempts++;
+            if (Fail)
+            {
+                throw new IOException("The disk is full.");
+            }
+
+            Saved = data;
+            SaveCount++;
+        }
+    }
+
+    internal sealed class RecordingReporter : IErrorReporter
+    {
+        public List<RandomiserError> Errors { get; } = new List<RandomiserError>();
+
+        public void Report(RandomiserError error) => Errors.Add(error);
+    }
+
+    /// <summary>
+    /// Deterministic stand-in for the dispatcher/thread-pool scheduler. Debounced callbacks and
+    /// background work only run when the test says so, which makes ordering scenarios repeatable.
+    /// </summary>
+    internal sealed class ManualScheduler : IRefreshScheduler
+    {
+        private readonly Queue<Action> work = new Queue<Action>();
+        private Action debounced;
+
+        /// <summary>When true, background work waits for <see cref="CompleteNext"/> instead of running inline.</summary>
+        public bool HoldWork { get; set; }
+
+        public int DebounceCalls { get; private set; }
+        public bool Disposed { get; private set; }
+        public int PendingWork => work.Count;
+        public bool HasDebounced => debounced != null;
+
+        public void Debounce(Action callback)
+        {
+            DebounceCalls++;
+            debounced = callback;
+        }
+
+        /// <summary>The debounce interval elapsed. Returns false if nothing was waiting.</summary>
+        public bool FireDebounce()
+        {
+            var callback = debounced;
+            debounced = null;
+            callback?.Invoke();
+            return callback != null;
+        }
+
+        public void Run<T>(Func<T> job, Action<T, Exception> completed)
+        {
+            Action run = () =>
+            {
+                var result = default(T);
+                Exception error = null;
+                try
+                {
+                    result = job();
+                }
+                catch (Exception e)
+                {
+                    error = e;
+                }
+
+                completed(result, error);
+            };
+
+            if (HoldWork)
+            {
+                work.Enqueue(run);
+            }
+            else
+            {
+                run();
+            }
+        }
+
+        public void CompleteNext() => work.Dequeue()();
+
+        public void Dispose() => Disposed = true;
+    }
+
+    /// <summary>A catalog that hands the coordinator a caller-supplied snapshot function.</summary>
+    internal sealed class SnapshotCatalog : IGameCatalog, ILibrarySnapshotSource
+    {
+        private readonly IGameCatalog inner;
+
+        public SnapshotCatalog(IGameCatalog inner) => this.inner = inner;
+
+        public Func<IGameCatalog> Snapshot { get; set; }
+
+        public Func<IGameCatalog> PrepareSnapshot(bool includeFilteredView) =>
+            Snapshot ?? (() => LibrarySnapshot.Capture(inner, includeFilteredView));
+
+        public GameInfo TryGet(Guid gameId) => inner.TryGet(gameId);
+
+        public IReadOnlyList<GameInfo> GetAllGames() => inner.GetAllGames();
+
+        public IReadOnlyList<GameInfo> GetFilteredGames() => inner.GetFilteredGames();
+
+        public IReadOnlyList<NamedItem> GetLookup(LookupKind kind) => inner.GetLookup(kind);
     }
 
     internal sealed class FixedClock : IClock

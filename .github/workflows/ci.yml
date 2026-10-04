@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build, test and package
+    # The extension targets .NET Framework 4.6.2 and WPF, so it has to be built and tested on Windows.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      DOTNET_NOLOGO: 'true'
+      DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Validate release metadata
+        shell: pwsh
+        run: ./build/pack.ps1 -ValidateOnly
+
+      - name: Tag matches project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: ./build/pack.ps1 -ValidateOnly -ExpectedVersion '${{ github.ref_name }}'
+
+      - name: Restore
+        run: dotnet restore GameRandomiser.sln
+
+      - name: Build
+        run: dotnet build GameRandomiser.sln -c Release --no-restore
+
+      - name: Unit tests
+        run: dotnet test GameRandomiser.sln -c Release --no-build --logger "trx;LogFileName=tests.trx" --results-directory artifacts/test-results
+
+      # Hosts the real WPF views against a mocked Playnite API: spins, dynamic wheel refreshes,
+      # reroll protection, save failures and shutdown. Fails on any failed check or binding error.
+      - name: UI integration harness
+        shell: pwsh
+        run: |
+          $exe = 'tools/VisualHarness/bin/Release/net462/GameRandomiser.VisualHarness.exe'
+          $process = Start-Process -FilePath $exe -ArgumentList "`"$PWD/artifacts/harness`"" -Wait -PassThru
+          Get-Content artifacts/harness/harness-log.txt | Where-Object { $_ -notmatch '^dialog:' }
+          exit $process.ExitCode
+
+      - name: Package
+        shell: pwsh
+        run: ./build/pack.ps1 -NoBuild
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pext
+          path: artifacts/*.pext
+          if-no-files-found: error
+
+      - name: Upload test results and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            artifacts/test-results
+            artifacts/harness
+
+  release:
+    name: Draft GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pext
+          path: package
+
+      # A draft, never published automatically: a person reviews the notes and presses Publish.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" package/*.pext \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "Game Randomiser $TAG" \
+            --generate-notes

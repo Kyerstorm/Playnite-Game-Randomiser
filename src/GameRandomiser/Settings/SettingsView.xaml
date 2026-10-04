@@ -161,7 +161,61 @@
             <CheckBox Content="Automatically launch the winning game (if installed)" IsChecked="{Binding Settings.AutoLaunchWinner}" Margin="0,10,0,4" />
             <CheckBox Content="Celebrate with confetti" IsChecked="{Binding Settings.ShowConfetti}" Margin="0,4" />
             <TextBlock Style="{StaticResource Hint}" Margin="0,10,0,0"
-                       Text="Every game on a wheel always has exactly the same chance of winning. Arrangement, history, playtime and install state never affect the odds." />
+                       Text="Every eligible game on a wheel always has exactly the same chance of winning. Arrangement, history, playtime and install state never affect the odds." />
+
+            <!-- Reroll protection -->
+            <TextBlock Text="Reroll protection" Style="{StaticResource Section}" />
+            <CheckBox Content="Protect against rerolling until you get the game you wanted" IsChecked="{Binding RerollEnabled}" Margin="0,4"
+                      AutomationProperties.Name="Enable reroll protection" />
+            <TextBlock Style="{StaticResource Hint}"
+                       Text="Off by default. Protection only decides which games can be picked next; the games that remain are always equally likely. Recent winners and reroll counts are tracked separately for each wheel." />
+            <Grid IsEnabled="{Binding RerollEnabled}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="200" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <TextBlock Text="Recent winners" Style="{StaticResource Label}" />
+                <ComboBox Grid.Column="1" Width="260" HorizontalAlignment="Left" Margin="0,4"
+                          ItemsSource="{Binding ExclusionOptions}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                          SelectedValue="{Binding RerollExclusion}" AutomationProperties.Name="Recent winner protection" />
+                <TextBlock Grid.Row="1" Text="Winners to skip" Style="{StaticResource Label}" />
+                <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,4" IsEnabled="{Binding CanEditRecentWinnerCount}">
+                    <Slider Width="240" Minimum="1" Maximum="10" TickFrequency="1" IsSnapToTickEnabled="True"
+                            Value="{Binding RecentWinnerCount}" AutomationProperties.Name="Number of recent winners to skip" />
+                    <TextBlock Text="{Binding RecentWinnerCountText}" VerticalAlignment="Center" FontWeight="SemiBold" Margin="14,0,0,0" />
+                </StackPanel>
+                <CheckBox Grid.Row="2" Grid.Column="1" Margin="0,10,0,4" Content="Limit how many times I can reroll a pick"
+                          IsChecked="{Binding LimitRerolls}" />
+                <TextBlock Grid.Row="3" Text="Rerolls allowed" Style="{StaticResource Label}" />
+                <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,4" IsEnabled="{Binding CanEditRerollLimit}">
+                    <Slider Width="240" Minimum="1" Maximum="10" TickFrequency="1" IsSnapToTickEnabled="True"
+                            Value="{Binding MaxRerolls}" AutomationProperties.Name="Rerolls allowed" />
+                    <TextBlock Text="{Binding MaxRerollsText}" VerticalAlignment="Center" FontWeight="SemiBold" Margin="14,0,0,0" />
+                </StackPanel>
+                <CheckBox Grid.Row="4" Grid.Column="1" Margin="0,10,0,4" Content="Allow rerolls again after a cooldown"
+                          IsChecked="{Binding RerollCooldownEnabled}" IsEnabled="{Binding CanEditRerollLimit}" />
+                <TextBlock Grid.Row="5" Text="Cooldown" Style="{StaticResource Label}" />
+                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Margin="0,4" IsEnabled="{Binding CanEditRerollCooldown}">
+                    <Slider Width="240" Minimum="1" Maximum="60" TickFrequency="1" IsSnapToTickEnabled="True"
+                            Value="{Binding RerollCooldownMinutes}" AutomationProperties.Name="Cooldown in minutes" />
+                    <TextBlock Text="{Binding RerollCooldownText}" VerticalAlignment="Center" FontWeight="SemiBold" Margin="14,0,0,0" />
+                </StackPanel>
+                <TextBlock Grid.Row="6" Text="Forget protection state" Style="{StaticResource Label}" />
+                <ComboBox Grid.Row="6" Grid.Column="1" Width="260" HorizontalAlignment="Left" Margin="0,4"
+                          ItemsSource="{Binding RerollResetOptions}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                          SelectedValue="{Binding RerollReset}" AutomationProperties.Name="When to forget protection state" />
+            </Grid>
+            <TextBlock Style="{StaticResource Hint}"
+                       Text="When the reroll limit is reached you need to accept the pick (Launch, Install or Accept pick) before spinning again, unless a cooldown is enabled. You can reset a wheel's protection at any time from the wheel view." />
         </StackPanel>
     </ScrollViewer>
 </UserControl>

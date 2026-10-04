@@ -75,6 +75,7 @@
                         <RowDefinition Height="*" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
                     <ComboBox Style="{StaticResource GR.ComboBox}" Margin="4,6,4,6" MaxWidth="560"
@@ -86,6 +87,8 @@
                                     <TextBlock Text="{Binding Icon}" Style="{StaticResource GR.Text}" Margin="0,0,8,0" />
                                     <TextBlock Text="{Binding Name}" Style="{StaticResource GR.Text}" FontWeight="SemiBold" />
                                     <TextBlock Text="{Binding CountText}" Style="{StaticResource GR.MutedText}" Margin="10,0,0,0" VerticalAlignment="Center" />
+                                    <TextBlock Text="· auto" Style="{StaticResource GR.MutedText}" Margin="6,0,0,0" VerticalAlignment="Center"
+                                               Visibility="{Binding IsDynamic, Converter={StaticResource BoolToVis}}" />
                                 </StackPanel>
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
@@ -111,13 +114,35 @@
                             IsEnabled="{Binding CanSpin}" Click="Spin_Click"
                             AutomationProperties.Name="Spin the wheel" ToolTip="Spin the wheel (you can also click the wheel)" />
 
-                    <Grid Grid.Row="3" MaxWidth="560" Margin="4,0">
+                    <!-- Reroll protection: what the next spin will do, or why it can't happen yet -->
+                    <WrapPanel x:Name="ProtectionBar" Grid.Row="3" HorizontalAlignment="Center" MaxWidth="560" Margin="4,0,4,6"
+                               Visibility="{Binding HasProtectionStatus, Converter={StaticResource BoolToVis}}">
+                        <TextBlock x:Name="ProtectionStatus" Text="{Binding ProtectionStatusText}" Style="{StaticResource GR.MutedText}" TextWrapping="Wrap"
+                                   TextAlignment="Center" VerticalAlignment="Center" Margin="0,0,8,0"
+                                   AutomationProperties.Name="Reroll protection status" />
+                        <Button Style="{StaticResource GR.FlatButton}" Content="Accept pick" Click="AcceptPick_Click"
+                                Visibility="{Binding CanAcceptPick, Converter={StaticResource BoolToVis}}"
+                                ToolTip="Keep the last pick. Your rerolls are restored for the next round." />
+                        <Button Style="{StaticResource GR.FlatButton}" Content="Reset" Click="ResetProtection_Click"
+                                Visibility="{Binding CanResetProtection, Converter={StaticResource BoolToVis}}"
+                                AutomationProperties.Name="Reset reroll protection"
+                                ToolTip="Forget recent winners, used rerolls and any cooldown for this wheel" />
+                    </WrapPanel>
+
+                    <Grid Grid.Row="4" MaxWidth="560" Margin="4,0">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
-                        <TextBlock Text="{Binding GameCountText}" Style="{StaticResource GR.MutedText}" VerticalAlignment="Center" FontSize="14" />
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Text="{Binding GameCountText}" Style="{StaticResource GR.MutedText}" VerticalAlignment="Center" FontSize="14" />
+                            <Border x:Name="DynamicBadge" Style="{StaticResource GR.Badge}" Background="{DynamicResource GR.SurfaceAlt}" Margin="8,0,0,0"
+                                    Visibility="{Binding DynamicBadgeText, Converter={StaticResource NullToVis}}"
+                                    ToolTip="{Binding DynamicBadgeToolTip}">
+                                <TextBlock Text="{Binding DynamicBadgeText}" Style="{StaticResource GR.MutedText}" FontSize="11" />
+                            </Border>
+                        </StackPanel>
                         <Button Grid.Column="1" Style="{StaticResource GR.FlatButton}" Click="Shuffle_Click" IsEnabled="{Binding CanEdit}"
                                 ToolTip="Shuffle the arrangement. Doesn't pick a winner or count as a spin." AutomationProperties.Name="Shuffle wheel">
                             <StackPanel Orientation="Horizontal">
@@ -195,7 +220,7 @@
                             <Button Style="{StaticResource GR.Button}" Content="Clear games" Margin="0,0,6,6" Click="Clear_Click" ToolTip="Remove every game from this wheel" />
                             <Button Style="{StaticResource GR.Button}" Content="Refresh from criteria" Margin="0,0,6,6" Click="RefreshCriteria_Click"
                                     Visibility="{Binding CanRefreshFromCriteria, Converter={StaticResource BoolToVis}}"
-                                    ToolTip="Add library games that now match the criteria this wheel was created from" />
+                                    ToolTip="Check the library against this wheel's criteria now" />
                             <Button Style="{StaticResource GR.DangerButton}" Content="Delete" Margin="0,0,6,6" Click="Delete_Click" ToolTip="Delete this wheel (games stay in your library)" />
                         </WrapPanel>
                         <Grid>
@@ -220,6 +245,11 @@
                                                             Visibility="{Binding IsActive, Converter={StaticResource BoolToVis}}">
                                                         <TextBlock Text="current" Style="{StaticResource GR.Text}" FontSize="11" />
                                                     </Border>
+                                                    <Border Style="{StaticResource GR.Badge}" Background="{DynamicResource GR.SurfaceAlt}" Margin="6,0,0,0"
+                                                            Visibility="{Binding IsDynamic, Converter={StaticResource BoolToVis}}"
+                                                            ToolTip="This wheel keeps itself in sync with its criteria">
+                                                        <TextBlock Text="auto" Style="{StaticResource GR.MutedText}" FontSize="11" />
+                                                    </Border>
                                                 </StackPanel>
                                                 <TextBlock Text="{Binding Description}" Style="{StaticResource GR.MutedText}" FontSize="12"
                                                            Visibility="{Binding HasDescription, Converter={StaticResource BoolToVis}}" />
@@ -239,11 +269,50 @@
                         <TextBlock DockPanel.Dock="Top" Style="{StaticResource GR.MutedText}" FontSize="12" Margin="0,2,0,0"
                                    Text="{Binding ActiveWheelDescription, StringFormat=Created from: {0}}"
                                    Visibility="{Binding ActiveWheelDescription, Converter={StaticResource NullToVis}}" />
+                        <!-- Membership policy: only for wheels created from criteria -->
+                        <StackPanel x:Name="MembershipPanel" DockPanel.Dock="Top" Margin="0,8,0,0"
+                                    Visibility="{Binding CanRefreshFromCriteria, Converter={StaticResource BoolToVis}}">
+                            <DockPanel>
+                                <TextBlock Text="Updates" Style="{StaticResource GR.MutedText}" VerticalAlignment="Center" Margin="0,0,8,0" />
+                                <ComboBox x:Name="PolicyCombo" Style="{StaticResource GR.ComboBox}" HorizontalAlignment="Left" MinWidth="230"
+                                          ItemsSource="{Binding PolicyOptions}" SelectedItem="{Binding SelectedPolicy, Mode=TwoWay}"
+                                          IsEnabled="{Binding CanEdit}" AutomationProperties.Name="Membership policy"
+                                          ToolTip="{Binding SelectedPolicy.Description}">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding Label}" Style="{StaticResource GR.Text}" ToolTip="{Binding Description}" />
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                            </DockPanel>
+                            <TextBlock x:Name="RefreshStatus" Text="{Binding RefreshStatusText}" TextWrapping="Wrap" FontSize="12" Margin="0,6,0,0"
+                                       Visibility="{Binding ShowRefreshStatus, Converter={StaticResource BoolToVis}}"
+                                       ToolTip="{Binding RefreshStatusDetail}" AutomationProperties.Name="Refresh status">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock" BasedOn="{StaticResource GR.MutedText}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsRefreshStale}" Value="True">
+                                                <Setter Property="Foreground" Value="{DynamicResource GR.Warning}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </StackPanel>
                         <TextBox DockPanel.Dock="Top" Style="{StaticResource GR.TextBox}" Tag="Search games…" Margin="0,10,0,6"
                                  Text="{Binding ManageSearch, UpdateSourceTrigger=PropertyChanged, Delay=150}" AutomationProperties.Name="Search games in this wheel" />
                         <WrapPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
                             <Button Style="{StaticResource GR.AccentButton}" Content="Add games" Margin="0,0,6,6" Click="AddGames_Click" ToolTip="Pick games from your library" />
                             <Button Style="{StaticResource GR.Button}" Content="Remove selected" Margin="0,0,6,6" Click="RemoveSelected_Click" ToolTip="Remove the ticked games from this wheel" />
+                            <Button Style="{StaticResource GR.Button}" Content="📌 Pin selected" Margin="0,0,6,6" Click="PinSelected_Click"
+                                    Visibility="{Binding CanPin, Converter={StaticResource BoolToVis}}" AutomationProperties.Name="Pin selected games"
+                                    ToolTip="Keep the ticked games on this wheel even if they stop matching the criteria" />
+                            <Button Style="{StaticResource GR.Button}" Content="Unpin selected" Margin="0,0,6,6" Click="UnpinSelected_Click"
+                                    Visibility="{Binding CanPin, Converter={StaticResource BoolToVis}}"
+                                    ToolTip="Let the criteria decide whether the ticked games stay on this wheel" />
+                            <Button Style="{StaticResource GR.Button}" Content="{Binding RestoreRemovedText}" Margin="0,0,6,6" Click="RestoreRemoved_Click"
+                                    Visibility="{Binding CanRestoreRemoved, Converter={StaticResource BoolToVis}}"
+                                    ToolTip="Games you removed from this wheel stay off it. This lets them return if they still match." />
                             <Button Style="{StaticResource GR.Button}" Content="Select all" Margin="0,0,6,6" Click="SelectAll_Click" />
                             <Button Style="{StaticResource GR.Button}" Content="Select none" Margin="0,0,6,6" Click="SelectNone_Click" />
                             <Button Style="{StaticResource GR.FlatButton}" Content="← Back to wheel" Margin="0,0,6,6" Click="BackToWheel_Click" />
@@ -260,8 +329,13 @@
                                                 <ColumnDefinition Width="*" />
                                                 <ColumnDefinition Width="Auto" />
                                             </Grid.ColumnDefinitions>
-                                            <CheckBox Style="{StaticResource GR.CheckBox}" IsChecked="{Binding IsChecked, Mode=TwoWay}" AutomationProperties.Name="{Binding Name}">
-                                                <TextBlock Text="{Binding Name}" Style="{StaticResource GR.Text}" />
+                                            <CheckBox Style="{StaticResource GR.CheckBox}" IsChecked="{Binding IsChecked, Mode=TwoWay}" AutomationProperties.Name="{Binding AccessibleName}">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <TextBlock Text="{Binding Name}" Style="{StaticResource GR.Text}" />
+                                                    <TextBlock Text="📌 pinned" Style="{StaticResource GR.MutedText}" FontSize="11" Margin="8,0,0,0" VerticalAlignment="Center"
+                                                               Visibility="{Binding IsPinned, Converter={StaticResource BoolToVis}}"
+                                                               ToolTip="Stays on this wheel even if it stops matching the criteria" />
+                                                </StackPanel>
                                             </CheckBox>
                                             <Border Grid.Column="1" Style="{StaticResource GR.Badge}" Background="{DynamicResource GR.SurfaceAlt}" Margin="8,0,0,0">
                                                 <TextBlock Text="{Binding InstallText}" FontSize="11">
@@ -368,7 +442,20 @@
                                     <Button Style="{StaticResource GR.FlatButton}" Content="Undo" Foreground="{DynamicResource GR.Accent}" Click="UndoRemove_Click" Margin="4,0,0,0" />
                                 </StackPanel>
 
-                                <Button Style="{StaticResource GR.AccentButton}" Content="SPIN AGAIN" Margin="0,14,0,0" Padding="12,10" FontSize="15" Click="SpinAgain_Click" />
+                                <TextBlock x:Name="WinnerProtection" Text="{Binding ProtectionText}" Style="{StaticResource GR.MutedText}" FontSize="12"
+                                           TextWrapping="Wrap" TextAlignment="Center" Margin="0,12,0,0"
+                                           Visibility="{Binding ProtectionText, Converter={StaticResource NullToVis}}"
+                                           AutomationProperties.Name="Reroll protection" />
+                                <Button Style="{StaticResource GR.AccentButton}" Content="SPIN AGAIN" Margin="0,14,0,0" Padding="12,10" FontSize="15" Click="SpinAgain_Click"
+                                        IsEnabled="{Binding CanSpinAgain}" />
+                                <UniformGrid Columns="2" Margin="0,8,0,0">
+                                    <Button Style="{StaticResource GR.Button}" Content="✓  Accept pick" Margin="0,0,4,0" Click="AcceptPick_Click"
+                                            Visibility="{Binding CanAccept, Converter={StaticResource BoolToVis}}"
+                                            ToolTip="Keep this pick. Your rerolls are restored for the next round." />
+                                    <Button Style="{StaticResource GR.Button}" Content="Reset protection" Margin="4,0,0,0" Click="ResetProtection_Click"
+                                            Visibility="{Binding CanResetProtection, Converter={StaticResource BoolToVis}}"
+                                            ToolTip="Forget recent winners, used rerolls and any cooldown for this wheel" />
+                                </UniformGrid>
                                 <UniformGrid Columns="2" Margin="0,8,0,0">
                                     <Button Style="{StaticResource GR.Button}" Content="▶  Launch" Margin="0,0,4,8" Click="Launch_Click"
                                             Visibility="{Binding CanLaunch, Converter={StaticResource BoolToVis}}" ToolTip="Launch with Playnite" />
@@ -414,9 +501,17 @@
                                 <Run Text="{Binding StatusText, Mode=OneWay}" />
                                 <Run Text="{Binding WheelName, Mode=OneWay, StringFormat=· {0}}" />
                             </TextBlock>
+                            <TextBlock Text="{Binding ProtectionText}" Style="{StaticResource GR.MutedText}" FontSize="12" TextWrapping="Wrap"
+                                       Visibility="{Binding ProtectionText, Converter={StaticResource NullToVis}}"
+                                       AutomationProperties.Name="Reroll protection" />
                         </StackPanel>
                         <WrapPanel Grid.Column="2" VerticalAlignment="Center" MaxWidth="320" HorizontalAlignment="Right">
-                            <Button Style="{StaticResource GR.AccentButton}" Content="Spin again" Margin="4" Click="SpinAgain_Click" />
+                            <Button Style="{StaticResource GR.AccentButton}" Content="Spin again" Margin="4" Click="SpinAgain_Click"
+                                    IsEnabled="{Binding CanSpinAgain}" />
+                            <Button Style="{StaticResource GR.Button}" Content="Accept pick" Margin="4" Click="AcceptPick_Click"
+                                    Visibility="{Binding CanAccept, Converter={StaticResource BoolToVis}}" />
+                            <Button Style="{StaticResource GR.Button}" Content="Reset protection" Margin="4" Click="ResetProtection_Click"
+                                    Visibility="{Binding CanResetProtection, Converter={StaticResource BoolToVis}}" />
                             <Button Style="{StaticResource GR.Button}" Content="Launch" Margin="4" Click="Launch_Click"
                                     Visibility="{Binding CanLaunch, Converter={StaticResource BoolToVis}}" />
                             <Button Style="{StaticResource GR.Button}" Content="Install" Margin="4" Click="Install_Click"

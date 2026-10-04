@@ -64,9 +64,47 @@ namespace GameRandomiser.Core.Persistence
         /// <summary>Migrator with all production steps registered.</summary>
         public static DataMigrator CreateDefault()
         {
-            // Schema version 1 is the initial release; add future steps here, e.g.
-            // .AddStep(1, doc => { /* rename/reshape v1 properties into v2 */ });
-            return new DataMigrator();
+            return new DataMigrator().AddStep(1, UpgradeV1ToV2);
+        }
+
+        /// <summary>
+        /// v2 introduces membership policies. v1 reserved an always-false IsDynamic flag, so every
+        /// existing wheel becomes a manual snapshot and keeps behaving exactly as it did.
+        /// </summary>
+        private static void UpgradeV1ToV2(JObject document)
+        {
+            if (!(document[nameof(RandomiserData.Wheels)] is JArray wheels))
+            {
+                return;
+            }
+
+            foreach (var token in wheels)
+            {
+                if (!(token is JObject wheel))
+                {
+                    continue;
+                }
+
+                var flag = wheel["IsDynamic"];
+                var wasDynamic = flag != null && flag.Type == JTokenType.Boolean && flag.Value<bool>()
+                    && wheel[nameof(RandomiserWheel.Population)] is JObject;
+                wheel.Remove("IsDynamic");
+                if (wheel[nameof(RandomiserWheel.MembershipPolicy)] == null)
+                {
+                    wheel[nameof(RandomiserWheel.MembershipPolicy)] =
+                        (int)(wasDynamic ? MembershipPolicy.StrictCriteria : MembershipPolicy.ManualSnapshot);
+                }
+
+                if (wheel[nameof(RandomiserWheel.PinnedGameIds)] == null)
+                {
+                    wheel[nameof(RandomiserWheel.PinnedGameIds)] = new JArray();
+                }
+
+                if (wheel[nameof(RandomiserWheel.ExcludedGameIds)] == null)
+                {
+                    wheel[nameof(RandomiserWheel.ExcludedGameIds)] = new JArray();
+                }
+            }
         }
     }
 }
